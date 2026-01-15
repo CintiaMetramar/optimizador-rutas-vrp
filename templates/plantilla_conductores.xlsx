@@ -1,0 +1,37 @@
+# En modules/excel_processor.py
+def generar_plantilla_conductores(self) -> bytes:
+    """Generar plantilla Excel para conductores"""
+    
+    datos = {
+        'Nombre': ['Juan Pérez', 'María García', 'Carlos López'],
+        'Telefono': ['+34600123456', '+34600567890', '+34600987654'],
+        'Vehiculo': ['1234ABC', '5678DEF', '9012GHI'],
+        'Etiqueta_C': [True, True, False],
+        'Capacidad_m3': [6, 9, 3],
+        'Notas': ['Experiencia 5 años', 'Nuevo', 'Solo retiradas']
+    }
+    
+    df = pd.DataFrame(datos)
+    
+    # Guardar en buffer
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name='Conductores', index=False)
+        
+        # Añadir hoja de instrucciones
+        instrucciones = pd.DataFrame({
+            'Columna': ['Nombre', 'Telefono', 'Vehiculo', 'Etiqueta_C', 'Capacidad_m3', 'Notas'],
+            'Descripción': [
+                'Nombre completo del conductor',
+                'Teléfono para WhatsApp (con +34)',
+                'Matrícula del vehículo',
+                'TRUE si tiene etiqueta C, FALSE si no',
+                'Capacidad en metros cúbicos (3, 6, 9, etc.)',
+                'Notas adicionales'
+            ],
+            'Requerido': ['Sí', 'Sí', 'No', 'Sí', 'Sí', 'No']
+        })
+        instrucciones.to_excel(writer, sheet_name='Instrucciones', index=False)
+    
+    buffer.seek(0)
+    return buffer.getvalue()
