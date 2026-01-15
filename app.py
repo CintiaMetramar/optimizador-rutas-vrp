@@ -637,11 +637,24 @@ class OptimizadorVRPApp:
                 # Configurar optimizador
                 self.optimizer.configurar(**st.session_state.parametros)
                 
+     
                 # Ejecutar optimización
                 rutas = self.optimizer.optimizar(st.session_state.df_geocodificado)
                 
+                # Guardar resultados (CORREGIDO)
+                if rutas:
+                    st.session_state.rutas_optimizadas = rutas
+                    st.session_state.paso_actual = max(st.session_state.paso_actual, 4)
+                    st.success(f"✅ {len(rutas)} rutas optimizadas generadas")
+                    
+                    # Mostrar resumen
+                    self.mostrar_resumen_optimizacion(rutas)
+                    self.mostrar_rutas_detalladas(rutas)
+                else:
+                    st.error("❌ No se pudieron generar rutas válidas.")
+                
                 # Guardar resultados
-                st.session_state.rutas_optimizadas = rutos
+                st.session_state.rutas_optimizadas = rutas
                 st.session_state.paso_actual = max(st.session_state.paso_actual, 4)
                 
                 # Mostrar resultados
