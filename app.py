@@ -6,8 +6,6 @@ Aplicación completa con Streamlit + Algoritmo VRP + WhatsApp Web
 import streamlit as st
 import pandas as pd
 import numpy as np
-import folium
-from streamlit_folium import st_folium
 from datetime import datetime, timedelta
 import tempfile
 import os
@@ -17,12 +15,35 @@ import json
 from typing import Dict, List, Any
 import io
 
-# Módulos personalizados
-from modules.geocoder import GeocodificadorOffline
-from modules.optimizer_vrp import OptimizadorVRP
-from modules.whatsapp_web import WhatsAppLinkGenerator
-from modules.excel_processor import ExcelProcessor
-from modules.conductor_manager import ConductorManager
+# IMPORTAR CON TRY/EXCEPT PARA MANEJAR FALLOS
+try:
+    import folium
+    from streamlit_folium import st_folium
+    FOLIUM_AVAILABLE = True
+except ImportError:
+    st.warning("⚠️ Folium no está instalado. Algunas funciones de mapa no estarán disponibles.")
+    FOLIUM_AVAILABLE = False
+    # Crear objetos dummy para evitar errores
+    folium = None
+    st_folium = lambda *args, **kwargs: None
+
+# Módulos personalizados - importar con try/except
+try:
+    from modules.geocoder import GeocodificadorOffline
+    from modules.optimizer_vrp import OptimizadorVRP
+    from modules.whatsapp_web import WhatsAppLinkGenerator
+    from modules.excel_processor import ExcelProcessor
+    from modules.conductor_manager import ConductorManager
+    MODULES_AVAILABLE = True
+except ImportError as e:
+    st.error(f"⚠️ Error importando módulos: {e}")
+    st.info("Asegúrate de que los módulos estén en la carpeta 'modules/'")
+    MODULES_AVAILABLE = False
+    # Crear clases dummy
+    class DummyClass:
+        def __init__(self, *args, **kwargs): pass
+        def __getattr__(self, name): return lambda *args, **kwargs: None
+    GeocodificadorOffline = OptimizadorVRP = WhatsAppLinkGenerator = ExcelProcessor = ConductorManager = DummyClass
 
 # ============================================================================
 # CONFIGURACIÓN DE PÁGINA
@@ -46,11 +67,6 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-    /* Estilos generales */
-    .main {
-        padding: 0rem 1rem;
-    }
-    
     /* Títulos */
     h1, h2, h3 {
         color: #1E3A8A;
@@ -87,12 +103,6 @@ st.markdown("""
         margin: 15px 0;
         border-left: 5px solid #25D366;
         box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        transition: transform 0.2s;
-    }
-    
-    .route-card:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 4px 8px rgba(0,0,0,0.15);
     }
     
     /* Botones */
@@ -100,12 +110,6 @@ st.markdown("""
         border-radius: 8px;
         font-weight: 600;
         padding: 10px 24px;
-        transition: all 0.3s;
-    }
-    
-    .stButton > button:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 4px 12px rgba(0,0,0,0.15);
     }
     
     /* Badges */
@@ -133,23 +137,14 @@ st.markdown("""
         color: white;
     }
     
-    /* Animaciones */
-    @keyframes fadeIn {
-        from { opacity: 0; transform: translateY(10px); }
-        to { opacity: 1; transform: translateY(0); }
-    }
-    
+    /* Animación simple */
     .fade-in {
         animation: fadeIn 0.5s ease-out;
     }
     
-    /* Scroll personalizado */
-    .scrollable-table {
-        max-height: 400px;
-        overflow-y: auto;
-        border: 1px solid #E5E7EB;
-        border-radius: 8px;
-        padding: 10px;
+    @keyframes fadeIn {
+        from { opacity: 0; }
+        to { opacity: 1; }
     }
 </style>
 """, unsafe_allow_html=True)
@@ -160,7 +155,11 @@ st.markdown("""
 
 class OptimizadorVRPApp:
     def __init__(self):
-        """Inicializar aplicación con todos los módulos"""
+        """Inicializar aplicación con manejo de errores"""
+        if not MODULES_AVAILABLE:
+            st.error("❌ Módulos no disponibles. Verifica la instalación.")
+            return
+            
         self.geocoder = GeocodificadorOffline()
         self.optimizer = OptimizadorVRP()
         self.whatsapp = WhatsAppLinkGenerator()
@@ -198,46 +197,28 @@ class OptimizadorVRPApp:
             st.session_state.conductores_cargados = False
         if 'parametros' not in st.session_state:
             st.session_state.parametros = {}
-    
+
     def mostrar_header(self):
-        """Mostrar encabezado de la aplicación"""
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col2:
-            st.markdown("""
-            <div style="text-align: center; padding: 20px 0;">
-                <h1 style="margin-bottom: 10px;">🚛 OPTIMIZADOR VRP DE RUTAS</h1>
-                <h3 style="color: #6B7280; font-weight: 400;">
-                    Sistema Inteligente de Gestión de Recolección de Residuos
-                </h3>
-            </div>
-            """, unsafe_allow_html=True)
-    
+        """Mostrar cabecera de la aplicación"""
+        st.title("🚛 Optimizador de Rutas VRP")
+        st.markdown("Gestión Inteligente de Residuos y Rutas")
+        st.markdown("---")
+
     def mostrar_sidebar(self):
-        """Mostrar barra lateral con controles"""
+        """Muestra la barra lateral de navegación"""
         with st.sidebar:
-            # Logo y título
-            st.markdown("""
-            <div style="text-align: center; margin-bottom: 30px;">
-                <h2 style="color: #1E3A8A;">⚙️ PANEL DE CONTROL</h2>
-                <p style="color: #6B7280; font-size: 14px;">
-                    Proceso paso a paso de optimización
-                </p>
-            </div>
-            """, unsafe_allow_html=True)
+            st.header("Navegación")
             
-            # Indicador de pasos
-            st.markdown("### 📋 PASOS")
-            
-            # Paso 1: Cargar datos
+            # Paso 1: Cargar
             paso1 = st.container()
             with paso1:
                 col1, col2 = st.columns([1, 4])
                 with col1:
-                    st.markdown(f"<h3>{'✅' if st.session_state.paso_actual > 1 else '1️⃣'}</h3>", 
-                               unsafe_allow_html=True)
+                    icono = '✅' if st.session_state.paso_actual > 1 else '1️⃣'
+                    st.markdown(f"<h3>{icono}</h3>", unsafe_allow_html=True)
                 with col2:
                     st.markdown("**Cargar Datos**")
-            
+
             # Paso 2: Geocodificar
             paso2 = st.container()
             with paso2:
@@ -1049,12 +1030,65 @@ class OptimizadorVRPApp:
         st.markdown("</div>", unsafe_allow_html=True)
 
 # ============================================================================
-# EJECUCIÓN PRINCIPAL
+# EJECUCIÓN PRINCIPAL CON MANEJO DE ERRORES
 # ============================================================================
 
-if __name__ == "__main__":
-    # Inicializar aplicación
-    app = OptimizadorVRPApp()
+def main():
+    """Función principal con manejo de errores"""
     
-    # Ejecutar
-    app.run()
+    # Mostrar mensaje de advertencia si folium no está disponible
+    if not FOLIUM_AVAILABLE:
+        st.warning("""
+        ⚠️ **Folium no está instalado**
+        
+        Para ver los mapas, instala folium:
+        ```
+        pip install folium==0.14.0 streamlit-folium==0.15.1
+        ```
+        
+        La aplicación funcionará sin mapas por ahora.
+        """)
+    
+    # Mostrar mensaje si los módulos no están disponibles
+    if not MODULES_AVAILABLE:
+        st.error("""
+        ❌ **Módulos no encontrados**
+        
+        Asegúrate de que la carpeta 'modules/' contenga:
+        - geocoder.py
+        - optimizer_vrp.py  
+        - whatsapp_web.py
+        - excel_processor.py
+        - conductor_manager.py
+        """)
+        
+        # Mostrar estructura esperada
+        with st.expander("📁 Estructura de archivos esperada"):
+            st.code("""
+            optimizador-rutas-vrp/
+            ├── app.py
+            ├── requirements.txt
+            ├── config.py
+            ├── modules/
+            │   ├── __init__.py
+            │   ├── geocoder.py
+            │   ├── optimizer_vrp.py
+            │   ├── whatsapp_web.py
+            │   ├── excel_processor.py
+            │   └── conductor_manager.py
+            ├── data/
+            └── templates/
+            """)
+        
+        return
+    
+    # Inicializar y ejecutar aplicación
+    try:
+        app = OptimizadorVRPApp()
+        app.run()
+    except Exception as e:
+        st.error(f"❌ Error en la aplicación: {str(e)}")
+        st.info("Revisa la consola para más detalles.")
+
+if __name__ == "__main__":
+    main()
