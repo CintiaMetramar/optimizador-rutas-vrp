@@ -7,3 +7,6 @@ geopy
 openpyxl
 xlsxwriter
 ortools
+matplotlib
+scipy
+scikit-learn
