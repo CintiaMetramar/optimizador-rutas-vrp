@@ -1,70 +1,63 @@
 """
-Generador de enlaces para WhatsApp Web
+Generador de enlaces para WhatsApp Web - Versión Detallada
 """
 import urllib.parse
 from datetime import datetime
 from typing import Dict, Any
 
 class WhatsAppLinkGenerator:
-    """Genera enlaces directos a WhatsApp Web con mensajes predefinidos"""
-    
-    def __init__(self):
-        # Plantillas base
-        pass
     
     def generar_mensaje_ruta(self, vehiculo: str, ruta: Dict[str, Any]) -> str:
-        """
-        Genera el mensaje de texto formateado para el conductor.
-        """
-        stats = ruta.get('estadisticas', {})
         servicios = ruta.get('servicios', [])
         
-        # Construir cabecera
+        # Cabecera
         mensaje = [
-            f"🚛 *RUTA ASIGNADA - {datetime.now().strftime('%d/%m/%Y')}*",
-            f"👤 *VEHÍCULO:* {vehiculo}",
-            f"📦 *SERVICIOS:* {stats.get('num_servicios', len(servicios))}",
-            "",
-            "📍 *ITINERARIO DETALLADO:*"
+            f"🚛 *RUTA {vehiculo} - {datetime.now().strftime('%d/%m')}*",
+            f"📦 Total Servicios: {len(servicios)-1}",
+            "--------------------------------"
         ]
         
-        # Añadir paradas
-        for i, servicio in enumerate(servicios, 1):
-            direccion = servicio.get('Direccion', 'Sin dirección')
-            cliente = servicio.get('Cliente', 'Cliente')
-            hora = servicio.get('Hora Pide', 'Flexible')
+        # Paradas
+        for i, servicio in enumerate(servicios):
+            if i == 0: # Inicio
+                mensaje.append(f"🏁 *{servicio['Direccion']}*")
+                mensaje.append("--------------------------------")
+                continue
+                
+            # Iconos según tipo
+            tipo = str(servicio.get('Tipo', '')).upper()
+            icono = "🔹"
+            if "SUMINISTRO" in tipo: icono = "🏗️"
+            elif "CAMBIO" in tipo: icono = "🔄"
+            elif "DEPOSITO" in tipo: icono = "⬇️"
+            elif "RETIRADA" in tipo: icono = "⬆️"
+            elif "VERTIDO" in tipo: icono = "🚮"
+
+            # Cuerpo del servicio DETALLADO
+            mensaje.append(f"{i}. {icono} *{servicio.get('Concepto', 'SERVICIO')}*")
+            
+            # Si hay material específico
             material = servicio.get('Material', '')
-            
-            # Icono según tipo
-            icono = "🛑" if "retirada" in str(material).lower() else "🔹"
-            
-            parada = f"{i}. {icono} *{cliente}*\n   🏠 {direccion}\n   ⏰ {hora}"
             if material:
-                parada += f"\n   📋 {material}"
+                mensaje.append(f"   📦 {material}")
             
-            mensaje.append(parada)
-            mensaje.append("")  # Espacio entre paradas
+            mensaje.append(f"   🏠 {servicio.get('Direccion', 'Ubicación')}")
+            
+            # HORA DESTACADA
+            hora = servicio.get('Hora Pide', 'Flexible')
+            if hora and hora != 'Flexible':
+                mensaje.append(f"   ⏰ *HORA: {hora}*")
+            else:
+                mensaje.append(f"   ⏰ Flexible")
+                
+            mensaje.append("") # Espacio
         
-        # Añadir pie de página con resumen
-        mensaje.extend([
-            "📊 *RESUMEN:*",
-            f"📏 Distancia est.: {stats.get('distancia_total_km', 0):.1f} km",
-            f"⏱️ Tiempo est.: {stats.get('tiempo_total_min', 0):.0f} min",
-            "",
-            "✅ Por favor, confirma recepción con un 👍"
-        ])
-        
+        mensaje.append("✅ Confirma con OK")
         return "\n".join(mensaje)
     
     def generar_enlace_whatsapp(self, mensaje: str, telefono: str = "") -> str:
-        """
-        Crea el enlace clicable para abrir WhatsApp Web.
-        Si hay teléfono, abre el chat directo. Si no, abre ventana para elegir contacto.
-        """
         mensaje_codificado = urllib.parse.quote(mensaje)
-        
         if telefono:
-            # Limpiar teléfono
             telefono = ''.join(filter(str.isdigit, str(telefono)))
             return f"https://web.whatsapp.com/send?phone={telefono}&text={mensaje_codificado}"
         else:
