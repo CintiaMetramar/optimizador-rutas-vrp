@@ -441,7 +441,8 @@ class OptimizadorVRPApp:
                 
                 # Guardar resultados
                 st.session_state.df_geocodificado = df_geo
-                st.session_state.paso_actual = max(st.session_state.paso_actual, 3)
+                st.session_state.paso_actual = 3  # Forzar el paso 3
+                st.rerun()  # <--- ESTA LÍNEA ES CRUCIAL, si falta, la app no se refresca
                 
                 # Mostrar resultados
                 st.success(f"✅ {df_geo['geocodificado'].sum()}/{len(df_geo)} direcciones geocodificadas")
@@ -1091,4 +1092,5 @@ def main():
         st.info("Revisa la consola para más detalles.")
 
 if __name__ == "__main__":
+
     main()
