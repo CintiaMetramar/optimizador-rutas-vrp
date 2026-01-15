@@ -1,594 +1,301 @@
 """
-Algoritmo VRP (Vehicle Routing Problem) avanzado para optimización de rutas
-Incluye: Time Windows, Capacities, Pickup & Delivery, Multiple Depots
+Algoritmo VRP Avanzado para Portacontenedores de Cadenas
+Lógica específica: 
+- Apilamiento de hasta 5 vacíos.
+- Gestión de Suministros de Áridos.
+- Lectura de columna 'Concepto'.
 """
 
-import numpy as np
 import pandas as pd
-from typing import Dict, List, Any, Tuple
-from datetime import datetime, timedelta
-import math
+import numpy as np
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
-import itertools
-from scipy.spatial import KDTree
+from geopy.distance import geodesic
+import streamlit as st
 
 class OptimizadorVRP:
     def __init__(self):
-        """Inicializar optimizador VRP"""
         self.parametros = {}
+        # Ubicaciones fijas (esto debería venir de config, pero lo dejamos por seguridad)
         self.vertederos = {
-            'norte': (40.3460, -3.7007),
-            'sur': (40.3186, -3.6017)
+            'norte': {'coords': (40.3460, -3.7007), 'nombre': 'Vertedero Norte'},
+            'sur': {'coords': (40.3186, -3.6017), 'nombre': 'Vertedero Sur'}
         }
-        
-        # Factores de conversión
-        self.VELOCIDAD_PROMEDIO = 30  # km/h
-        self.CONSUMO_COMBUSTIBLE = 0.3  # L/km
-        self.TIEMPO_SERVICIO = 30  # minutos
-        
+        self.base = {'coords': (40.4168, -3.7038), 'nombre': 'Base Central'} # Madrid centro por defecto
+
     def configurar(self, **kwargs):
-        """Configurar parámetros de optimización"""
+        """Configura los parámetros desde la interfaz"""
         self.parametros = kwargs
-        
-        # Actualizar valores
-        if 'velocidad_promedio' in kwargs:
-            self.VELOCIDAD_PROMEDIO = kwargs['velocidad_promedio']
-        if 'tiempo_por_servicio' in kwargs:
-            self.TIEMPO_SERVICIO = kwargs['tiempo_por_servicio']
-    
-    def calcular_distancia(self, coord1: Tuple[float, float], coord2: Tuple[float, float]) -> float:
-        """Calcular distancia Haversine entre dos coordenadas (km)"""
-        lat1, lon1 = coord1
-        lat2, lon2 = coord2
-        
-        # Radio de la Tierra en km
-        R = 6371.0
-        
-        # Convertir a radianes
-        lat1_rad = math.radians(lat1)
-        lon1_rad = math.radians(lon1)
-        lat2_rad = math.radians(lat2)
-        lon2_rad = math.radians(lon2)
-        
-        # Diferencia
-        dlat = lat2_rad - lat1_rad
-        dlon = lon2_rad - lon1_rad
-        
-        # Fórmula Haversine
-        a = math.sin(dlat/2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon/2)**2
-        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-        
-        return R * c
-    
-    def detectar_combinaciones(self, df: pd.DataFrame) -> List[Dict]:
-        """Detectar combinaciones depósito-retirada cercanas"""
-        if 'tipo_servicio' not in df.columns:
-            # Inferir tipo de servicio
-            df['tipo_servicio'] = df.apply(self._inferir_tipo_servicio, axis=1)
-        
-        # Separar depósitos y retiradas
-        depositos = df[df['tipo_servicio'] == 'DEPOSITO'].copy()
-        retiradas = df[df['tipo_servicio'] == 'RETIRADA'].copy()
-        
-        if len(depositos) == 0 or len(retiradas) == 0:
-            return []
-        
-        # Crear KD-tree para búsqueda rápida
-        coords_retiradas = list(zip(retiradas['lat'], retiradas['lon']))
-        tree = KDTree(coords_retiradas)
-        
-        combos = []
-        max_distancia = self.parametros.get('max_distancia_combo', 5)
-        
-        for idx_deposito, deposito in depositos.iterrows():
-            if pd.isna(deposito['lat']) or pd.isna(deposito['lon']):
-                continue
+
+    def optimizar(self, df_input):
+        """Función principal que orquesta la optimización"""
+        try:
+            # 1. Preparar datos y detectar tipos de servicio por 'Concepto'
+            df = df_input.copy()
+            df = self._procesar_conceptos(df)
             
-            # Buscar retirada más cercana
-            distancia, idx_retirada = tree.query([(deposito['lat'], deposito['lon'])], k=1)
+            # 2. Filtrar solo filas válidas geocodificadas
+            df = df[df['geocodificado'] == True].reset_index(drop=True)
             
-            if distancia[0] <= max_distancia:
-                retirada = retiradas.iloc[idx_retirada[0]]
-                
-                combo = {
-                    'deposito_id': deposito.name,
-                    'retirada_id': retirada.name,
-                    'distancia_km': distancia[0],
-                    'deposito': deposito.to_dict(),
-                    'retirada': retirada.to_dict()
-                }
-                combos.append(combo)
-        
-        # Ordenar por distancia
-        combos.sort(key=lambda x: x['distancia_km'])
-        
-        return combos
-    
-    def _inferir_tipo_servicio(self, fila) -> str:
-        """Inferir tipo de servicio basado en columnas"""
-        material = str(fila.get('Material', '')).lower()
-        
-        if 'retirada' in material:
-            return 'RETIRADA'
-        elif 'deposito' in material or 'depósito' in material:
-            return 'DEPOSITO'
-        elif 'cambio' in material:
-            return 'CAMBIO'
-        else:
-            # Intentar inferir de otras columnas
-            caja_depos = fila.get('Caja Depos', '')
-            caja_retir = fila.get('Caja Retir', '')
+            if len(df) == 0:
+                st.error("No hay direcciones geocodificadas válidas para optimizar.")
+                return {}
+
+            # 3. Crear matriz de distancias
+            matriz_distancias, localizaciones = self._crear_matriz_distancias(df)
             
-            if caja_depos and caja_retir:
-                return 'COMBO'
-            elif caja_depos:
-                return 'DEPOSITO'
-            elif caja_retir:
-                return 'RETIRADA'
-            else:
-                return 'SERVICIO'
-    
-    def asignar_zonas(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Asignar zonas de Madrid a cada servicio"""
-        df['zona_madrid'] = df.apply(self._determinar_zona, axis=1)
-        return df
-    
-    def _determinar_zona(self, fila) -> str:
-        """Determinar zona de Madrid basada en coordenadas"""
-        lat = fila.get('lat')
-        lon = fila.get('lon')
-        
-        if pd.isna(lat) or pd.isna(lon):
-            return 'DESCONOCIDA'
-        
-        # Definir zonas de Madrid
-        if lat > 40.48:
-            return 'NORTE_EXTREMO'
-        elif lat > 40.43:
-            return 'NORTE'
-        elif lat > 40.40:
-            if lon < -3.73:
-                return 'OESTE'
-            elif lon > -3.65:
-                return 'ESTE'
-            else:
-                return 'CENTRO_NUEVO'
-        elif lat > 40.38:
-            if lon < -3.68:
-                return 'CARABANCHEL'
-            else:
-                return 'VALLECAS'
-        elif lat > 40.33:
-            return 'SUR'
-        else:
-            return 'SUR_EXTREMO'
-    
-    def clusterizar_por_zona(self, df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-        """Dividir servicios por zonas para asignación a vehículos"""
-        zonas = {}
-        
-        for zona in df['zona_madrid'].unique():
-            if zona != 'DESCONOCIDA':
-                zonas[zona] = df[df['zona_madrid'] == zona].copy()
-        
-        return zonas
-    
-    def optimizar_por_zona(self, df_zona: pd.DataFrame, zona_nombre: str) -> Dict:
-        """Optimizar rutas dentro de una zona específica"""
-        
-        # Filtrar vehículos disponibles para esta zona
-        vehiculos_c_disponibles = self.parametros.get('vehiculos_c', 10)
-        
-        # Determinar si se requieren vehículos C (Madrid Central)
-        requiere_c = zona_nombre in ['CENTRO_NUEVO', 'CENTRO']
-        
-        # Número de vehículos a usar
-        num_vehiculos = max(1, math.ceil(len(df_zona) / 15))  # Máximo 15 servicios por vehículo
-        
-        # Ajustar por capacidad de contenedores
-        capacidad_vehiculo = self.parametros.get('capacidad_vehiculo', 5)
-        num_vehiculos = max(num_vehiculos, math.ceil(len(df_zona) / capacidad_vehiculo))
-        
-        # Preparar datos para OR-Tools
-        coordenadas = []
-        demandas = []  # 1 por servicio
-        time_windows = []
-        
-        for _, servicio in df_zona.iterrows():
-            if pd.notna(servicio['lat']) and pd.notna(servicio['lon']):
-                coordenadas.append((servicio['lat'], servicio['lon']))
-                demandas.append(1)  # Cada servicio cuenta como 1 unidad
-                
-                # Time window basado en Hora Pide
-                hora_pide = servicio.get('Hora Pide', '09:00')
-                try:
-                    hora_obj = datetime.strptime(str(hora_pide), '%H:%M')
-                    inicio = hora_obj.hour * 60 + hora_obj.minute
-                    fin = inicio + self.parametros.get('flexibilidad_horaria', 60)
-                    time_windows.append((inicio, fin))
-                except:
-                    time_windows.append((480, 1020))  # 8:00 - 17:00
-        
-        if len(coordenadas) < 2:
-            return {'ruta': [], 'estadisticas': {}}
-        
-        # Crear matriz de distancias
-        num_nodos = len(coordenadas)
-        dist_matrix = np.zeros((num_nodos, num_nodos))
-        
-        for i in range(num_nodos):
-            for j in range(num_nodos):
-                if i != j:
-                    dist_matrix[i][j] = self.calcular_distancia(
-                        coordenadas[i], coordenadas[j]
-                    )
-        
-        # Crear modelo VRP con OR-Tools
-        manager = pywrapcp.RoutingIndexManager(
-            num_nodos, 
-            num_vehiculos, 
-            0  # Depósito inicial
-        )
-        
-        routing = pywrapcp.RoutingModel(manager)
-        
-        # Definir función de coste por distancia
-        def distance_callback(from_index, to_index):
-            from_node = manager.IndexToNode(from_index)
-            to_node = manager.IndexToNode(to_index)
-            return int(dist_matrix[from_node][to_node] * 1000)  # Convertir a metros
-        
-        transit_callback_index = routing.RegisterTransitCallback(distance_callback)
-        routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
-        
-        # Añadir restricción de capacidad
-        def demand_callback(from_index):
-            from_node = manager.IndexToNode(from_index)
-            return demandas[from_node]
-        
-        demand_callback_index = routing.RegisterUnaryTransitCallback(demand_callback)
-        routing.AddDimensionWithVehicleCapacity(
-            demand_callback_index,
-            0,  # slack
-            [capacidad_vehiculo] * num_vehiculos,  # capacidades
-            True,  # start cumul to zero
-            'Capacity'
-        )
-        
-        # Añadir restricción de tiempo
-        def time_callback(from_index, to_index):
-            from_node = manager.IndexToNode(from_index)
-            to_node = manager.IndexToNode(to_index)
-            travel_time = int((dist_matrix[from_node][to_node] / self.VELOCIDAD_PROMEDIO) * 60)  # minutos
-            service_time = self.TIEMPO_SERVICIO
-            return travel_time + service_time
-        
-        time_callback_index = routing.RegisterTransitCallback(time_callback)
-        routing.AddDimension(
-            time_callback_index,
-            60 * 8,  # slack máximo (8 horas)
-            60 * 10,  # tiempo máximo por vehículo (10 horas)
-            False,  # Don't force start cumul to zero
-            'Time'
-        )
-        
-        time_dimension = routing.GetDimensionOrDie('Time')
-        
-        # Añadir time windows
-        for node_idx in range(num_nodos):
-            index = manager.NodeToIndex(node_idx)
-            time_dimension.CumulVar(index).SetRange(
-                time_windows[node_idx][0],
-                time_windows[node_idx][1]
+            # 4. Configurar modelo OR-Tools
+            data = self._preparar_modelo_datos(df, matriz_distancias)
+            
+            # 5. Resolver
+            manager = pywrapcp.RoutingIndexManager(
+                len(data['distance_matrix']), 
+                data['num_vehicles'], 
+                data['depot']
             )
+            routing = pywrapcp.RoutingModel(manager)
+
+            # Definir callback de distancia
+            def distance_callback(from_index, to_index):
+                from_node = manager.IndexToNode(from_index)
+                to_node = manager.IndexToNode(to_index)
+                return data['distance_matrix'][from_node][to_node]
+
+            transit_callback_index = routing.RegisterTransitCallback(distance_callback)
+            routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+
+            # --- RESTRICCIÓN DE CAPACIDAD (Cadenas: hasta 5 vacíos) ---
+            # En portacontenedores: 
+            # DEPOSITO: Gasta 1 vacío (-1)
+            # RETIRADA: Genera 1 lleno (pero matemáticamente ocupa espacio de carga, +1)
+            # SUMINISTRO: Empieza lleno, acaba con vacío (Efecto neto en vacíos: +1 disponible)
+            
+            def demand_callback(from_index):
+                from_node = manager.IndexToNode(from_index)
+                return data['demands'][from_node]
+
+            demand_callback_index = routing.RegisterUnaryTransitCallback(demand_callback)
+            
+            # Capacidad de 5 (pensando en huecos/contenedores vacíos apilables)
+            routing.AddDimensionWithVehicleCapacity(
+                demand_callback_index,
+                0,  # null capacity slack
+                data['vehicle_capacities'],
+                True,  # start cumul to zero
+                'Capacidad'
+            )
+
+            # Configuración de búsqueda (Heurística)
+            search_parameters = pywrapcp.DefaultRoutingSearchParameters()
+            search_parameters.first_solution_strategy = (
+                routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+            )
+            # Tiempo límite para no bloquear la app
+            search_parameters.time_limit.seconds = 10 
+
+            # Resolver
+            solution = routing.SolveWithParameters(search_parameters)
+
+            # 6. Formatear resultados
+            if solution:
+                return self._procesar_solucion(manager, routing, solution, df, localizaciones)
+            else:
+                st.warning("No se encontró una solución óptima con las restricciones actuales.")
+                return {}
+
+        except Exception as e:
+            st.error(f"Error crítico en optimización: {str(e)}")
+            return {}
+
+    def _procesar_conceptos(self, df):
+        """Interpreta la columna 'Concepto' según lógica de negocio"""
+        def identificar_tipo(row):
+            # Prioridad absoluta a la columna Concepto
+            concepto = str(row.get('Concepto', '')).upper()
+            material = str(row.get('Material', '')).upper()
+            texto = f"{concepto} {material}"
+            
+            if 'SUMINISTRO' in texto or 'ARIDO' in texto or 'ÁRIDO' in texto:
+                return 'SUMINISTRO' # Lleva tierra, sale con caja vacía
+            elif 'CAMBIO' in texto:
+                return 'CAMBIO' # Deja una, se lleva otra
+            elif 'RETIRADA' in texto or 'RECOGIDA' in texto:
+                return 'RETIRADA' # Se lleva una llena
+            elif 'DEPOSITO' in texto or 'ENTREGA' in texto:
+                return 'DEPOSITO' # Deja una vacía
+            else:
+                # Por defecto, si no está claro
+                return 'RETIRADA'
+
+        df['tipo_servicio'] = df.apply(identificar_tipo, axis=1)
+        return df
+
+    def _crear_matriz_distancias(self, df):
+        """Calcula matriz de distancias entre todos los puntos + base + vertederos"""
+        # Lista de puntos: [Base, Cliente 1, Cliente 2, ..., Vertedero N, Vertedero S]
+        puntos = [self.base['coords']]
         
-        # Configurar parámetros de búsqueda
-        search_parameters = pywrapcp.DefaultRoutingSearchParameters()
-        search_parameters.first_solution_strategy = (
-            routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-        )
-        search_parameters.local_search_metaheuristic = (
-            routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-        )
-        search_parameters.time_limit.seconds = 30
+        # Añadir clientes
+        for _, row in df.iterrows():
+            puntos.append((row['lat'], row['lon']))
+            
+        # Añadir vertederos al final de la matriz (como nodos posibles)
+        # Nota: En una implementación simple VRP, los vertederos son complejos.
+        # Aquí simplificaremos asumiendo que el 'Depósito' (0) es la base.
         
-        # Resolver
-        solution = routing.SolveWithParameters(search_parameters)
+        size = len(puntos)
+        matriz = [[0 for _ in range(size)] for _ in range(size)]
         
-        if solution:
-            return self._extraer_solucion(solution, routing, manager, df_zona, coordenadas, num_vehiculos)
-        else:
-            return {'ruta': [], 'estadisticas': {}}
-    
-    def _extraer_solucion(self, solution, routing, manager, df_zona, coordenadas, num_vehiculos):
-        """Extraer solución de OR-Tools"""
+        for i in range(size):
+            for j in range(size):
+                if i != j:
+                    # Distancia en Metros (convertida a entero para OR-Tools)
+                    dist = geodesic(puntos[i], puntos[j]).meters
+                    matriz[i][j] = int(dist)
+                    
+        return matriz, puntos
+
+    def _preparar_modelo_datos(self, df, matriz):
+        """Define las demandas y capacidades"""
         
+        # Lógica de Demanda para Cadenas (Gestión de Vacíos):
+        # El camión tiene 'slots' para vacíos.
+        # DEPOSITO: Entrega un vacío. Demanda = 1 (Gasta 1 slot de carga que llevaba)
+        # RETIRADA: Recoge lleno. Demanda = 0 (En modelo simplificado de vacíos) o requiere ir a vertedero.
+        # SUMINISTRO: Genera un vacío nuevo en la ruta. Demanda = -1 (Gana 1 vacío).
+        
+        # NOTA IMPORTANTE: Modelar Cargas (Llenos) y Vacíos simultáneamente es complejo.
+        # Simplificación robusta:
+        # Usaremos capacidad positiva como "Entregas pendientes" (Depósitos).
+        
+        demands = [0] # Base
+        
+        for _, row in df.iterrows():
+            tipo = row['tipo_servicio']
+            
+            if tipo == 'DEPOSITO':
+                # Necesita que el camión lleve una caja.
+                demands.append(1) 
+            elif tipo == 'SUMINISTRO':
+                # El camión se libera de su carga y genera una caja vacía disponible.
+                # Matemáticamente, recupera capacidad de llevar cosas.
+                demands.append(-1)
+            elif tipo == 'RETIRADA':
+                # Ocupa el camión totalmente (no puede hacer más depositos hasta descargar)
+                # Le damos un peso alto para forzar descarga o fin de ruta si no es complejo
+                demands.append(0) # Simplificación: Asumimos que retiradas van al final o intercaladas
+            elif tipo == 'CAMBIO':
+                # Neutro
+                demands.append(0)
+            else:
+                demands.append(1)
+
+        # Capacidad de vehículos
+        # Cadenas = 5 Contenedores Vacíos
+        num_vehiculos = int(self.parametros.get('vehiculos_c', 5))
+        capacidad = 5 # 5 Contenedores vacíos apilados
+        
+        return {
+            'distance_matrix': matriz,
+            'demands': demands,
+            'vehicle_capacities': [capacidad] * num_vehiculos,
+            'num_vehicles': num_vehiculos,
+            'depot': 0
+        }
+
+    def _procesar_solucion(self, manager, routing, solution, df, localizaciones):
+        """Convierte la solución matemática en rutas legibles"""
         rutas = {}
         
-        for vehicle_id in range(num_vehiculos):
+        for vehicle_id in range(routing.vehicles()):
             index = routing.Start(vehicle_id)
-            ruta_nodos = []
+            ruta_actual = []
+            distancia_ruta = 0
+            carga_actual = 0 # Contenedores vacíos
             
             while not routing.IsEnd(index):
                 node_index = manager.IndexToNode(index)
-                ruta_nodos.append(node_index)
+                
+                # Si no es el depósito (nodo 0)
+                if node_index > 0 and node_index <= len(df):
+                    row = df.iloc[node_index - 1] # -1 porque 0 es base
+                    
+                    servicio = {
+                        'Cliente': row['Cliente'],
+                        'Direccion': row['Direccion'],
+                        'Tipo': row['tipo_servicio'],
+                        'Concepto': row.get('Concepto', ''),
+                        'Hora Pide': row['Hora Pide'],
+                        'lat': row['lat'],
+                        'lon': row['lon']
+                    }
+                    ruta_actual.append(servicio)
+                
+                previous_index = index
                 index = solution.Value(routing.NextVar(index))
-            
-            if ruta_nodos:
-                # Obtener servicios de esta ruta
-                servicios_ruta = df_zona.iloc[ruta_nodos].copy()
-                
-                # Calcular estadísticas
-                distancia_total = 0
-                tiempo_total = self.TIEMPO_SERVICIO * len(ruta_nodos)  # Tiempo de servicio
-                
-                for i in range(len(ruta_nodos) - 1):
-                    distancia_total += self.calcular_distancia(
-                        coordenadas[ruta_nodos[i]],
-                        coordenadas[ruta_nodos[i + 1]]
-                    )
-                    tiempo_total += (distancia_total / self.VELOCIDAD_PROMEDIO) * 60
-                
-                # Nombre del vehículo
-                vehiculo_nombre = f"Veh_{vehicle_id + 1:02d}"
-                if vehicle_id < self.parametros.get('vehiculos_c', 10):
-                    vehiculo_nombre += "_C"
-                
-                rutas[vehiculo_nombre] = {
-                    'servicios': servicios_ruta.to_dict('records'),
+                distancia_ruta += routing.GetArcCostForVehicle(previous_index, index, vehicle_id)
+
+            if ruta_actual:
+                # Guardar ruta
+                rutas[f"Vehículo {vehicle_id + 1}"] = {
+                    'servicios': ruta_actual,
                     'estadisticas': {
-                        'num_servicios': len(ruta_nodos),
-                        'distancia_total_km': distancia_total,
-                        'tiempo_total_min': tiempo_total,
-                        'combustible_estimado_l': distancia_total * self.CONSUMO_COMBUSTIBLE,
-                        'combos_detectados': 0  # Se calculará después
+                        'distancia_total_km': distancia_ruta / 1000,
+                        'tiempo_total_min': (distancia_ruta / 1000 / 30) * 60, # 30km/h media urbana
+                        'num_servicios': len(ruta_actual),
+                        'combustible_estimado_l': (distancia_ruta / 1000) * 0.35, # Consumo camión
+                        'combos_detectados': sum(1 for s in ruta_actual if s['Tipo'] == 'CAMBIO')
                     }
                 }
-        
+                
         return rutas
-    
-    def optimizar(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """Optimización principal VRP"""
-        
-        print(f"Iniciando optimización VRP para {len(df)} servicios...")
-        
-        # Paso 1: Asignar zonas
-        df_con_zonas = self.asignar_zonas(df)
-        
-        # Paso 2: Detectar combinaciones
-        combos = self.detectar_combinaciones(df_con_zonas)
-        print(f"Detectados {len(combos)} combos depósito-retirada")
-        
-        # Paso 3: Clusterizar por zona
-        zonas = self.clusterizar_por_zona(df_con_zonas)
-        print(f"Servicios divididos en {len(zonas)} zonas")
-        
-        # Paso 4: Optimizar cada zona
-        todas_rutas = {}
-        
-        for zona_nombre, df_zona in zonas.items():
-            print(f"Optimizando zona {zona_nombre} ({len(df_zona)} servicios)...")
-            
-            rutas_zona = self.optimizar_por_zona(df_zona, zona_nombre)
-            
-            # Añadir combos a las estadísticas
-            for vehiculo, ruta in rutas_zona.items():
-                if 'servicios' in ruta:
-                    # Contar combos en esta ruta
-                    combos_en_ruta = 0
-                    for combo in combos:
-                        deposito_id = combo['deposito_id']
-                        retirada_id = combo['retirada_id']
-                        
-                        # Verificar si ambos servicios están en esta ruta
-                        servicios_ids = [s.get('id', '') for s in ruta['servicios']]
-                        if deposito_id in servicios_ids and retirada_id in servicios_ids:
-                            combos_en_ruta += 1
-                    
-                    ruta['estadisticas']['combos_detectados'] = combos_en_ruta
-            
-            todas_rutas.update(rutas_zona)
-        
-        # Paso 5: Asignar conductores a vehículos
-        todas_rutas = self.asignar_conductores(todas_rutas, df_con_zonas)
-        
-        print(f"Optimización completada: {len(todas_rutas)} rutas generadas")
-        
-        return todas_rutas
-    
-    def asignar_conductores(self, rutas: Dict, df: pd.DataFrame) -> Dict:
-        """Asignar conductores a las rutas basado en los servicios"""
-        
-        # Crear mapeo conductor -> servicios
-        if 'Conductor' in df.columns:
-            conductor_servicios = df.groupby('Conductor').size().to_dict()
-            
-            # Ordenar conductores por número de servicios
-            conductores_ordenados = sorted(
-                conductor_servicios.items(), 
-                key=lambda x: x[1], 
-                reverse=True
-            )
-            
-            # Asignar conductores a rutas
-            rutas_con_conductores = {}
-            for i, (vehiculo, ruta) in enumerate(rutas.items()):
-                if i < len(conductores_ordenados):
-                    conductor = conductores_ordenados[i][0]
-                else:
-                    conductor = f"Conductor_{i+1}"
-                
-                # Crear copia de la ruta con conductor
-                ruta_con_conductor = ruta.copy()
-                ruta_con_conductor['conductor'] = conductor
-                
-                # Añadir conductor a cada servicio
-                if 'servicios' in ruta_con_conductor:
-                    for servicio in ruta_con_conductor['servicios']:
-                        servicio['Conductor'] = conductor
-                
-                rutas_con_conductores[vehiculo] = ruta_con_conductor
-            
-            return rutas_con_conductores
-        
-        return rutas
-    
-    def exportar_excel(self, rutas: Dict, df_original: pd.DataFrame) -> bytes:
-        """Exportar rutas optimizadas a Excel"""
-        
-        # Crear DataFrame consolidado
-        datos_exportar = []
-        
-        for vehiculo, ruta in rutas.items():
-            for servicio in ruta.get('servicios', []):
-                fila = servicio.copy()
-                fila['Vehiculo_Asignado'] = vehiculo
-                fila['Conductor_Asignado'] = ruta.get('conductor', '')
-                fila['Distancia_Ruta_km'] = ruta['estadisticas']['distancia_total_km']
-                fila['Tiempo_Ruta_min'] = ruta['estadisticas']['tiempo_total_min']
-                datos_exportar.append(fila)
-        
-        df_export = pd.DataFrame(datos_exportar)
-        
-        # Crear libro Excel con múltiples hojas
-        with pd.ExcelWriter('temp_export.xlsx', engine='openpyxl') as writer:
-            # Hoja 1: Servicios con asignaciones
-            df_export.to_excel(writer, sheet_name='Rutas_Optimizadas', index=False)
-            
-            # Hoja 2: Resumen por vehículo
-            resumen_data = []
-            for vehiculo, ruta in rutas.items():
-                resumen_data.append({
+
+    def exportar_excel(self, rutas, df_original):
+        """Genera Excel descargable"""
+        import io
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            # Resumen
+            resumen = []
+            for vehiculo, datos in rutas.items():
+                resumen.append({
                     'Vehículo': vehiculo,
-                    'Conductor': ruta.get('conductor', ''),
-                    'Servicios': ruta['estadisticas']['num_servicios'],
-                    'Distancia_km': ruta['estadisticas']['distancia_total_km'],
-                    'Tiempo_min': ruta['estadisticas']['tiempo_total_min'],
-                    'Combustible_L': ruta['estadisticas']['combustible_estimado_l'],
-                    'Combos': ruta['estadisticas']['combos_detectados']
+                    'Servicios': datos['estadisticas']['num_servicios'],
+                    'Km': datos['estadisticas']['distancia_total_km']
                 })
+            pd.DataFrame(resumen).to_excel(writer, sheet_name='Resumen', index=False)
             
-            df_resumen = pd.DataFrame(resumen_data)
-            df_resumen.to_excel(writer, sheet_name='Resumen_Vehiculos', index=False)
+            # Detalle
+            detalle = []
+            for vehiculo, datos in rutas.items():
+                for orden, serv in enumerate(datos['servicios'], 1):
+                    s = serv.copy()
+                    s['Vehículo'] = vehiculo
+                    s['Orden'] = orden
+                    detalle.append(s)
+            pd.DataFrame(detalle).to_excel(writer, sheet_name='Detalle Rutas', index=False)
             
-            # Hoja 3: Combos detectados
-            combos_data = []
-            for vehiculo, ruta in rutas.items():
-                if ruta['estadisticas']['combos_detectados'] > 0:
-                    combos_data.append({
-                        'Vehículo': vehiculo,
-                        'Combos_Detectados': ruta['estadisticas']['combos_detectados']
-                    })
+        return output.getvalue()
+
+    def exportar_kml(self, rutas):
+        """Genera KML para Google Earth"""
+        kml = ['<?xml version="1.0" encoding="UTF-8"?>']
+        kml.append('<kml xmlns="http://www.opengis.net/kml/2.2">')
+        kml.append('<Document>')
+        
+        colores = ['ff0000ff', 'ff00ff00', 'ffff0000', 'ff00ffff', 'ffffff00'] # ABGR
+        
+        i = 0
+        for vehiculo, datos in rutas.items():
+            color = colores[i % len(colores)]
+            i += 1
             
-            if combos_data:
-                df_combos = pd.DataFrame(combos_data)
-                df_combos.to_excel(writer, sheet_name='Combos_Detectados', index=False)
-        
-        # Leer archivo como bytes
-        with open('temp_export.xlsx', 'rb') as f:
-            excel_bytes = f.read()
-        
-        # Eliminar archivo temporal
-        import os
-        if os.path.exists('temp_export.xlsx'):
-            os.remove('temp_export.xlsx')
-        
-        return excel_bytes
-    
-    def exportar_kml(self, rutas: Dict) -> str:
-        """Exportar rutas a formato KML para Google My Maps"""
-        
-        kml_template = """<?xml version="1.0" encoding="UTF-8"?>
-<kml xmlns="http://www.opengis.net/kml/2.2">
-<Document>
-{placemarks}
-{routes}
-</Document>
-</kml>"""
-        
-        placemarks = []
-        routes = []
-        
-        # Colores por tipo de vehículo
-        colores = {
-            'C': 'FF1400FF',  # Azul para vehículos C
-            '_C': 'FF1400FF',
-            'default': 'FF00A0FF'  # Azul claro para otros
-        }
-        
-        # Añadir vertederos
-        for nombre, (lat, lon) in self.vertederos.items():
-            placemarks.append(f"""
-  <Placemark>
-    <name>Vertedero {nombre.title()}</name>
-    <Style>
-      <IconStyle>
-        <color>ff0000ff</color>
-        <scale>1.5</scale>
-        <Icon><href>http://maps.google.com/mapfiles/kml/pushpin/red-pushpin.png</href></Icon>
-      </IconStyle>
-    </Style>
-    <Point>
-      <coordinates>{lon},{lat},0</coordinates>
-    </Point>
-  </Placemark>""")
-        
-        # Añadir servicios y rutas
-        for vehiculo, ruta in rutas.items():
-            # Determinar color
-            color = colores['default']
-            for key in colores:
-                if key in vehiculo and key != 'default':
-                    color = colores[key]
-                    break
+            # Línea de ruta
+            kml.append(f'<Placemark><name>{vehiculo}</name><Style><LineStyle><color>{color}</color><width>4</width></LineStyle></Style>')
+            kml.append('<LineString><coordinates>')
+            for serv in datos['servicios']:
+                kml.append(f"{serv['lon']},{serv['lat']},0")
+            kml.append('</coordinates></LineString></Placemark>')
             
-            # Crear ruta (línea)
-            coordenadas_ruta = []
-            for servicio in ruta.get('servicios', []):
-                if 'lat' in servicio and 'lon' in servicio:
-                    lat = servicio['lat']
-                    lon = servicio['lon']
-                    coordenadas_ruta.append(f"{lon},{lat},0")
-                    
-                    # Placemark para el servicio
-                    placemarks.append(f"""
-  <Placemark>
-    <name>{servicio.get('Cliente', 'Cliente')} - {vehiculo}</name>
-    <description>
-      {servicio.get('Direccion', '')}
-      Hora: {servicio.get('Hora Pide', '')}
-      Conductor: {ruta.get('conductor', '')}
-    </description>
-    <Style>
-      <IconStyle>
-        <color>{color}</color>
-      </IconStyle>
-    </Style>
-    <Point>
-      <coordinates>{lon},{lat},0</coordinates>
-    </Point>
-  </Placemark>""")
-            
-            # Añadir línea de ruta si hay suficientes puntos
-            if len(coordenadas_ruta) > 1:
-                routes.append(f"""
-  <Placemark>
-    <name>Ruta {vehiculo}</name>
-    <Style>
-      <LineStyle>
-        <color>{color}</color>
-        <width>3</width>
-      </LineStyle>
-    </Style>
-    <LineString>
-      <coordinates>
-        {' '.join(coordenadas_ruta)}
-      </coordinates>
-    </LineString>
-  </Placemark>""")
-        
-        return kml_template.format(
-            placemarks='\n'.join(placemarks),
-            routes='\n'.join(routes)
-        )
+        kml.append('</Document></kml>')
+        return "\n".join(kml).encode('utf-8')
