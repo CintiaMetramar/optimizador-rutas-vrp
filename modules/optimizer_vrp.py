@@ -1,9 +1,10 @@
 """
-Algoritmo VRP Avanzado para Portacontenedores de Cadenas (Skip Loaders)
-Lógica específica: 
-- Gestión de flujos: Suministro -> Genera Vacío -> Permite Depósito
-- Vertederos específicos (Valdemingómez vs Laguna)
-- Capacidad de apilamiento
+Algoritmo VRP Experto para Cadenas (Skip Loaders)
+Lógica: Inventario de Cajas Vacías
+- El camión optimiza su carga inicial (0-5 cajas).
+- Suministro: Genera caja vacía (+1).
+- Depósito/Cambio: Gasta caja vacía (-1).
+- Prioriza Vertederos según columna Concepto/Dirección.
 """
 
 import pandas as pd
@@ -16,7 +17,7 @@ import streamlit as st
 class OptimizadorVRP:
     def __init__(self):
         self.parametros = {}
-        # Vertederos con sus coordenadas reales
+        # Coordenadas reales
         self.vertederos = {
             'LAGUNA': {'coords': (40.3460, -3.7007), 'nombre': 'Laguna del Marquesado'},
             'VALDEMINGOMEZ': {'coords': (40.3186, -3.6017), 'nombre': 'Valdemingómez'}
@@ -28,234 +29,207 @@ class OptimizadorVRP:
 
     def optimizar(self, df_input):
         try:
-            # 1. Preparar datos y detectar lógica de negocio
+            # 1. Interpretar Operativa (Depósito, Cambio, Suministro...)
             df = df_input.copy()
-            df = self._procesar_logica_negocio(df)
+            df = self._procesar_conceptos(df)
             
-            # Filtrar válidos
+            # Filtrar solo válidos
             df = df[df['geocodificado'] == True].reset_index(drop=True)
             if len(df) == 0: return {}
 
-            # 2. Crear matriz de distancias
-            # La matriz incluirá: [Base, Cliente 1...N, Vertedero Laguna, Vertedero Vald]
-            matriz, localizaciones, nodos_vertedero = self._crear_matriz_avanzada(df)
+            # 2. Matriz de Distancias (Incluyendo Vertederos como nodos de paso)
+            matriz, puntos, nodos_vertederos = self._crear_matriz(df)
             
-            # 3. Datos para OR-Tools
-            data = self._preparar_modelo_datos(df, matriz, nodos_vertedero)
-            
-            # 4. Configurar Routing
-            manager = pywrapcp.RoutingIndexManager(len(matriz), data['num_vehicles'], data['depot'])
+            # 3. Configurar OR-Tools
+            manager = pywrapcp.RoutingIndexManager(len(matriz), 
+                                                 int(self.parametros.get('vehiculos_c', 5)), 
+                                                 0) # 0 es el Depósito/Base
             routing = pywrapcp.RoutingModel(manager)
 
-            # Callback de Coste (Distancia + Penalizaciones por Vertedero incorrecto)
+            # --- CALLBACK DE COSTE (Distancia + Penalizaciones) ---
             def cost_callback(from_index, to_index):
                 from_node = manager.IndexToNode(from_index)
                 to_node = manager.IndexToNode(to_index)
                 coste = matriz[from_node][to_node]
                 
-                # --- LÓGICA EXPERTA: Restricción de Vertedero ---
-                # Si venimos de un cliente (from_node <= len(df)) que requiere Valdemingómez
-                # y vamos a un vertedero que NO es Valdemingómez -> Penalización brutal
+                # Penalización: Si el cliente pide un vertedero específico
                 if 0 < from_node <= len(df):
                     cliente = df.iloc[from_node - 1]
-                    destino_es_vertedero = to_node in nodos_vertedero.values()
+                    target_vertedero = cliente.get('vertedero_target')
                     
-                    if cliente['tipo_servicio'] in ['RETIRADA', 'CAMBIO'] and destino_es_vertedero:
-                        pref_vertedero = cliente.get('vertedero_preferido', 'CUALQUIERA')
+                    # Si va a un vertedero incorrecto -> Penalización gigante
+                    if target_vertedero == 'VALDEMINGOMEZ' and to_node == nodos_vertederos['LAGUNA']:
+                        return coste + 1000000
+                    if target_vertedero == 'LAGUNA' and to_node == nodos_vertederos['VALDEMINGOMEZ']:
+                        return coste + 1000000
                         
-                        # Si cliente exige Valdemingómez y vamos a Laguna
-                        if pref_vertedero == 'VALDEMINGOMEZ' and to_node == nodos_vertedero['LAGUNA']:
-                             return coste + 100000 # Penalización prohibitiva
-                        
-                        # Si cliente exige Laguna y vamos a Valdemingómez
-                        if pref_vertedero == 'LAGUNA' and to_node == nodos_vertedero['VALDEMINGOMEZ']:
-                             return coste + 100000
-
                 return coste
 
             transit_callback_index = routing.RegisterTransitCallback(cost_callback)
             routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
 
-            # --- DIMENSIÓN DE CAPACIDAD (Cajas Vacías) ---
-            # Suministro: -1 (Genera vacío) | Depósito: +1 (Gasta vacío) | Cambio: 0
+            # --- DIMENSIÓN DE INVENTARIO (Cajas Vacías) ---
+            # Modelamos el flujo de cajas:
+            # DEPOSITO: -1 (Dejas una caja)
+            # CAMBIO: -1 (Dejas una caja vacía para llevarte la llena)
+            # SUMINISTRO: +1 (Al descargar árido, te queda la caja vacía disponible)
+            # RETIRADA: 0 (No afecta al stock de vacías, pero requiere viaje a vertedero)
+            
+            demands = [0] # Base
+            demands.extend(df['delta_cajas'].tolist())
+            demands.extend([0, 0]) # Vertederos (no cambian stock, solo descargan)
+
             def demand_callback(from_index):
                 from_node = manager.IndexToNode(from_index)
-                return data['demands'][from_node]
+                return demands[from_node]
 
             demand_callback_index = routing.RegisterUnaryTransitCallback(demand_callback)
-            
-            # Capacidad de 5 cajas vacías apiladas
+
+            # Creamos la dimensión con "slack" para permitir que el camión salga con cajas
             routing.AddDimensionWithVehicleCapacity(
                 demand_callback_index,
-                0,  # Null capacity slack
-                data['vehicle_capacities'],
-                True,  # Start cumul to zero
-                'CapacidadCajas'
+                0,  # null capacity slack
+                [5] * manager.GetNumberOfVehicles(), # Capacidad máxima de 5 cajas
+                False, # <--- IMPORTANTE: False para permitir empezar con >0 cajas
+                'InventarioCajas'
             )
+            
+            # Restricción: El inventario nunca puede ser negativo (no puedes dejar caja si no tienes)
+            inventory_dimension = routing.GetDimensionOrDie('InventarioCajas')
+            for vehicle_id in range(manager.GetNumberOfVehicles()):
+                # Permitimos que la base (inicio) tenga entre 0 y 5 cajas
+                index = routing.Start(vehicle_id)
+                inventory_dimension.CumulVar(index).SetRange(0, 5)
 
-            # Búsqueda
+            # 4. Resolver
             search_parameters = pywrapcp.DefaultRoutingSearchParameters()
             search_parameters.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-            search_parameters.time_limit.seconds = 15
+            search_parameters.time_limit.seconds = 10
 
             solution = routing.SolveWithParameters(search_parameters)
 
             if solution:
-                return self._procesar_solucion(manager, routing, solution, df, localizaciones)
+                return self._procesar_solucion(manager, routing, solution, df, nodos_vertederos)
             else:
                 return {}
 
         except Exception as e:
-            st.error(f"Error en optimización: {str(e)}")
+            st.error(f"Error optimización: {e}")
             return {}
 
-    def _procesar_logica_negocio(self, df):
-        """Interpreta la operativa real de Cadenas"""
-        def analizar_fila(row):
+    def _procesar_conceptos(self, df):
+        """Traduce 'Concepto' a lógica de cajas (+1 / -1)"""
+        def analizar(row):
             texto = (str(row.get('Concepto', '')) + " " + str(row.get('Material', '')) + " " + str(row.get('Direccion', ''))).upper()
             
-            # 1. Detectar Vertedero Preferido
-            vertedero = 'CUALQUIERA'
+            # 1. Detectar Vertedero Obligatorio
+            vertedero = None
             if 'VALDEMINGOMEZ' in texto or 'VALDEMINGÓMEZ' in texto:
                 vertedero = 'VALDEMINGOMEZ'
             elif 'LAGUNA' in texto or 'MARQUESADO' in texto:
                 vertedero = 'LAGUNA'
-            
-            # 2. Detectar Tipo y Demanda de Cajas Vacías
-            # Demanda positiva = Gasta cajas vacías
-            # Demanda negativa = Genera cajas vacías (o libera hueco)
-            
+
+            # 2. Detectar Delta de Cajas (Inventario)
             tipo = 'RETIRADA'
-            demanda = 0 # Cambio por defecto
+            delta = 0 
             
             if 'SUMINISTRO' in texto or 'ARIDO' in texto:
                 tipo = 'SUMINISTRO'
-                demanda = -1 # Al descargar árido, genero 1 caja vacía disponible
+                delta = 1 # Genera +1 caja vacía disponible
             elif 'CAMBIO' in texto:
                 tipo = 'CAMBIO'
-                demanda = 0 # Dejo 1, cojo 1
+                delta = -1 # Gasta -1 caja vacía
             elif 'DEPOSITO' in texto or 'ENTREGA' in texto:
                 tipo = 'DEPOSITO'
-                demanda = 1 # Gasto 1 caja vacía
+                delta = -1 # Gasta -1 caja vacía
             elif 'RETIRADA' in texto or 'RECOGIDA' in texto:
                 tipo = 'RETIRADA'
-                demanda = 0 # No gasta 'caja vacía' per se, ocupa el camión entero (gestionado por otra restricción o simple flujo)
+                delta = 0 # Neutro para vacías (pero ocupa el camión con llena)
             
-            return pd.Series([tipo, demanda, vertedero])
+            return pd.Series([tipo, delta, vertedero])
 
-        df[['tipo_servicio', 'demanda_cajas', 'vertedero_preferido']] = df.apply(analizar_fila, axis=1)
+        df[['tipo_servicio', 'delta_cajas', 'vertedero_target']] = df.apply(analizar, axis=1)
         return df
 
-    def _crear_matriz_avanzada(self, df):
-        """Crea matriz incluyendo los vertederos como nodos visitables"""
-        puntos = [self.base['coords']]
+    def _crear_matriz(self, df):
+        puntos = [self.base['coords']] + [(r['lat'], r['lon']) for _, r in df.iterrows()]
         
-        # Clientes
-        for _, row in df.iterrows():
-            puntos.append((row['lat'], row['lon']))
-            
-        # Añadir Vertederos al final de la lista de nodos
+        # Añadir Vertederos
         idx_base = len(puntos)
-        nodos_vertedero = {}
+        nodos = {}
         
         puntos.append(self.vertederos['LAGUNA']['coords'])
-        nodos_vertedero['LAGUNA'] = idx_base
+        nodos['LAGUNA'] = idx_base
         
         puntos.append(self.vertederos['VALDEMINGOMEZ']['coords'])
-        nodos_vertedero['VALDEMINGOMEZ'] = idx_base + 1
+        nodos['VALDEMINGOMEZ'] = idx_base + 1
         
-        # Calcular distancias
         size = len(puntos)
-        matriz = [[0 for _ in range(size)] for _ in range(size)]
+        matriz = [[0]*size for _ in range(size)]
         
         for i in range(size):
             for j in range(size):
                 if i != j:
                     try:
-                        dist = geodesic(puntos[i], puntos[j]).meters
-                        matriz[i][j] = int(dist)
+                        matriz[i][j] = int(geodesic(puntos[i], puntos[j]).meters)
                     except:
-                        matriz[i][j] = 100000 # Penalizar errores
+                        matriz[i][j] = 100000
                         
-        return matriz, puntos, nodos_vertedero
+        return matriz, puntos, nodos
 
-    def _preparar_modelo_datos(self, df, matriz, nodos_vertedero):
-        # Demanda de cajas:
-        # Base = 0
-        # Clientes = columna 'demanda_cajas'
-        # Vertederos = 0 (Son puntos de paso/descarga)
-        
-        demands = [0] # Base
-        demands.extend(df['demanda_cajas'].tolist())
-        demands.extend([0, 0]) # Los 2 vertederos tienen demanda 0 de cajas
-        
-        num_vehiculos = int(self.parametros.get('vehiculos_c', 5))
-        
-        return {
-            'distance_matrix': matriz,
-            'demands': demands,
-            'vehicle_capacities': [5] * num_vehiculos, # 5 huecos de capacidad
-            'num_vehicles': num_vehiculos,
-            'depot': 0
-        }
-
-    def _procesar_solucion(self, manager, routing, solution, df, localizaciones):
+    def _procesar_solucion(self, manager, routing, solution, df, nodos_vertederos):
         rutas = {}
+        inv_dim = routing.GetDimensionOrDie('InventarioCajas')
         
-        # Indices de los vertederos en la lista total
-        idx_laguna = len(df) + 1
-        idx_valde = len(df) + 2
+        # Mapeo inverso de nodos de vertedero
+        vertedero_idx_to_name = {v: k for k, v in nodos_vertederos.items()}
         
         for vehicle_id in range(routing.vehicles()):
             index = routing.Start(vehicle_id)
-            ruta_actual = []
-            distancia_ruta = 0
+            ruta = []
+            dist = 0
+            
+            # Ver con cuántas cajas sale
+            cajas_inicio = solution.Value(inv_dim.CumulVar(index))
+            if routing.IsEnd(solution.Value(routing.NextVar(index))) and cajas_inicio == 0:
+                continue # Ruta vacía
+                
+            ruta.append({'Tipo': 'INICIO', 'Direccion': f'Base - Sale con {cajas_inicio} cajas vacías'})
             
             while not routing.IsEnd(index):
-                node_index = manager.IndexToNode(index)
+                node = manager.IndexToNode(index)
                 
-                # Identificar qué es este nodo
-                info_nodo = {}
-                
-                if node_index == 0:
-                    pass # Base
-                elif node_index <= len(df):
-                    # Es un Cliente
-                    row = df.iloc[node_index - 1]
-                    info_nodo = {
+                if 0 < node <= len(df): # Cliente
+                    row = df.iloc[node - 1]
+                    ruta.append({
                         'Cliente': row['Cliente'],
                         'Direccion': row['Direccion'],
                         'Tipo': row['tipo_servicio'],
                         'Concepto': row.get('Concepto', ''),
                         'lat': row['lat'], 'lon': row['lon']
-                    }
-                elif node_index == idx_laguna:
-                    info_nodo = {'Cliente': 'VERTEDERO LAGUNA', 'Tipo': 'VERTIDO', 'Direccion': 'Laguna del Marquesado', 'lat': 40.3460, 'lon': -3.7007}
-                elif node_index == idx_valde:
-                    info_nodo = {'Cliente': 'VERTEDERO VALDEMINGOMEZ', 'Tipo': 'VERTIDO', 'Direccion': 'Valdemingómez', 'lat': 40.3186, 'lon': -3.6017}
+                    })
+                elif node in vertedero_idx_to_name: # Vertedero
+                    nombre = vertedero_idx_to_name[node]
+                    ruta.append({'Cliente': f'VERTEDERO {nombre}', 'Tipo': 'VERTIDO', 'Direccion': 'Descarga'})
                 
-                if info_nodo:
-                    ruta_actual.append(info_nodo)
-                
-                previous_index = index
+                prev = index
                 index = solution.Value(routing.NextVar(index))
-                distancia_ruta += routing.GetArcCostForVehicle(previous_index, index, vehicle_id)
-
-            if ruta_actual:
+                dist += routing.GetArcCostForVehicle(prev, index, vehicle_id)
+            
+            if len(ruta) > 1:
                 rutas[f"Vehículo {vehicle_id + 1}"] = {
-                    'servicios': ruta_actual,
+                    'servicios': ruta,
                     'estadisticas': {
-                        'distancia_total_km': distancia_ruta / 1000,
-                        'tiempo_total_min': (distancia_ruta / 1000 / 30) * 60,
-                        'num_servicios': len(ruta_actual),
-                        'combustible_estimado_l': (distancia_ruta / 1000) * 0.35,
-                        'combos_detectados': 0
+                        'distancia_total_km': dist / 1000,
+                        'tiempo_total_min': (dist / 1000 / 30) * 60,
+                        'num_servicios': len(ruta) - 1, # Restar inicio
+                        'combustible_estimado_l': (dist / 1000) * 0.35,
+                        'combos_detectados': cajas_inicio
                     }
                 }
-                
         return rutas
     
-    # ... (Mantenemos exportar_excel y kml igual que antes)
+    # ... (Mantén aquí las funciones exportar_excel y exportar_kml del código anterior)
     def exportar_excel(self, rutas, df_original):
         import io
         output = io.BytesIO()
@@ -271,4 +245,4 @@ class OptimizadorVRP:
         return output.getvalue()
 
     def exportar_kml(self, rutas):
-        return b"" # Simplificado por espacio
+        return b""
