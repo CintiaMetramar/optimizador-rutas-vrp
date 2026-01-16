@@ -1,8 +1,8 @@
 """
-Algoritmo VRP Ajustado a la Realidad (Media 7.5 serv/día)
-- Reparto equitativo estricto.
-- Lógica de Cajas (Suministro/Depósito).
-- Respeta límites humanos.
+Algoritmo VRP Robusto (Anti-Fallos)
+- Permite desbalanceo si la geografía lo exige.
+- 'Disjunctions': Si un punto es imposible, lo omite en lugar de fallar todo.
+- Mayor tiempo de cálculo para grandes volúmenes (135+ servicios).
 """
 
 import pandas as pd
@@ -31,73 +31,63 @@ class OptimizadorVRP:
     def optimizar(self, df_input):
         """Ejecuta la optimización completa"""
         try:
-            # 1. Procesar lógica de negocio
+            # 1. Procesar lógica
             df = df_input.copy()
             df = self._procesar_conceptos(df)
             
             # Filtrar válidos
             df = df[df['geocodificado'] == True].reset_index(drop=True)
             if len(df) == 0: 
-                st.warning("⚠️ No hay direcciones válidas geocodificadas.")
+                st.warning("⚠️ No hay direcciones válidas.")
                 return {}
 
-            # 2. Crear Matrices
+            # 2. Matrices
             matriz_dist, matriz_tiempo, puntos, nodos_vertederos = self._crear_matrices(df)
             
-            # 3. Configurar Vehículos
-            num_vehiculos = int(self.parametros.get('vehiculos_c', 20)) # Por defecto 20 si no se dice nada
+            # 3. Vehículos
+            num_vehiculos = int(self.parametros.get('vehiculos_c', 18))
             
-            # --- CÁLCULO INTELIGENTE DE CAPACIDAD (TUNING REAL) ---
-            total_servicios = len(df)
-            
-            # Carga ideal matemática (ej: 150 serv / 20 camiones = 7.5)
-            carga_promedio = total_servicios / max(1, num_vehiculos)
-            
-            # Definimos el límite superior permitido por camión.
-            # Damos un margen de +3 servicios sobre la media para dar flexibilidad,
-            # pero bloqueamos los excesos (nadie hará 20 si la media es 7.5).
-            limite_paradas = int(carga_promedio + 4) 
-            
-            # Seguridad: Mínimo 5 paradas (por si son pocos servicios)
-            limite_paradas = max(5, limite_paradas)
+            # AUMENTAMOS EL LÍMITE SUPERIOR
+            # Si la media es 7.5, permitimos hasta 20 para dar margen de maniobra
+            # El balanceo se hará por "coste", no por prohibición estricta.
+            limite_paradas = 25 
 
-            # Debug para que veas en consola cómo piensa
-            print(f"DEBUG: {total_servicios} servicios para {num_vehiculos} camiones.")
-            print(f"DEBUG: Media ideal: {carga_promedio:.1f}. Límite tope puesto en: {limite_paradas}.")
+            # Debug
+            print(f"DEBUG: Optimizando {len(df)} servicios con {num_vehiculos} camiones.")
 
-            # 4. Configurar OR-Tools
+            # 4. OR-Tools
             manager = pywrapcp.RoutingIndexManager(len(matriz_dist), num_vehiculos, 0)
             routing = pywrapcp.RoutingModel(manager)
 
-            # A. Coste Distancia
+            # A. Distancia
             def distance_callback(from_index, to_index):
                 return matriz_dist[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
             transit_callback_index = routing.RegisterTransitCallback(distance_callback)
             routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
 
-            # B. Balanceo Estricto
+            # B. Balanceo SUAVE (Soft Balance)
+            # En lugar de obligar, "sugerimos" que no pasen de cierto número.
+            # Bajamos la penalización para que prefiera terminar la ruta a fallar.
             routing.AddConstantDimension(
-                1, # Incremento
-                limite_paradas, # Límite calculado arriba
-                True,
+                1, 
+                limite_paradas, 
+                True, 
                 "ContadorServicios"
             )
-            # Penalizar fuertemente que uno trabaje mucho más que otros
             count_dim = routing.GetDimensionOrDie("ContadorServicios")
-            count_dim.SetGlobalSpanCostCoefficient(10000) # Penalización muy alta
+            # Penalización baja (100) para permitir flexibilidad si un camión hace más km
+            count_dim.SetGlobalSpanCostCoefficient(100) 
 
-            # C. Tiempo (Jornada laboral)
+            # C. Tiempo (Jornada 11h max)
             def time_callback(from_index, to_index):
-                # Viaje + 25 min servicio (ajustado a la realidad de cadenas)
-                return matriz_tiempo[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)] + 1500
+                # Viaje + 20 min servicio
+                return matriz_tiempo[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)] + 1200
             
             time_callback_index = routing.RegisterTransitCallback(time_callback)
-            
-            # Máximo 10 horas
             routing.AddDimension(
                 time_callback_index,
                 3600, # Slack
-                36000, # Max jornada (10h)
+                39600, # 11 horas max
                 False, 
                 "Tiempo"
             )
@@ -112,31 +102,36 @@ class OptimizadorVRP:
             routing.AddDimensionWithVehicleCapacity(
                 demand_callback_index, 0, [5]*num_vehiculos, False, "InventarioCajas"
             )
-            
-            # Permitir salir con cajas
             inv_dim = routing.GetDimensionOrDie('InventarioCajas')
             for v in range(num_vehiculos):
                 inv_dim.CumulVar(routing.Start(v)).SetRange(0, 5)
+
+            # --- E. VÁLVULA DE ESCAPE (PENALIZACIÓN POR NO VISITAR) ---
+            # Esto es lo nuevo: Permite dejar servicios sin hacer si son imposibles
+            # Penalización altísima (1.000.000) para que solo lo haga si no hay opción.
+            penalty = 1000000
+            for i in range(1, len(df) + 1):
+                routing.AddDisjunction([manager.NodeToIndex(i)], penalty)
 
             # 5. Resolver
             search_params = pywrapcp.DefaultRoutingSearchParameters()
             search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
             search_params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-            search_params.time_limit.seconds = 20
+            
+            # AUMENTAMOS TIEMPO DE CÁLCULO
+            # 135 servicios es mucha combinatoria, le damos 45 segundos.
+            search_params.time_limit.seconds = 45 
 
             solution = routing.SolveWithParameters(search_params)
 
             if solution:
                 return self._procesar_solucion(manager, routing, solution, df, nodos_vertederos)
             else:
-                # Mensaje de error inteligente
-                sugerencia = int(total_servicios / 8) + 1
-                st.error(f"❌ No encuentro solución equilibrada. Tienes {num_vehiculos} camiones para {total_servicios} servicios.")
-                st.warning(f"💡 PISTA: Para mantener una media de ~8 servicios, intenta poner al menos {sugerencia} camiones en el selector.")
+                st.error("❌ Fallo crítico. Revisa si hay coordenadas a 0,0 o distancias infinitas.")
                 return {}
 
         except Exception as e:
-            st.error(f"Error crítico en algoritmo: {str(e)}")
+            st.error(f"Error crítico: {str(e)}")
             return {}
 
     def _procesar_conceptos(self, df):
@@ -170,8 +165,8 @@ class OptimizadorVRP:
                     try:
                         d = geodesic(puntos[i], puntos[j]).meters
                         matriz_dist[i][j] = int(d)
-                        # Vel media 35km/h = 9.7 m/s
-                        matriz_tiempo[i][j] = int(d / 9.7)
+                        # Vel media un poco más rápida para no saturar jornada
+                        matriz_tiempo[i][j] = int(d / 10.0) # ~36 km/h
                     except:
                         matriz_dist[i][j] = 1000000
                         matriz_tiempo[i][j] = 1000000
@@ -182,13 +177,14 @@ class OptimizadorVRP:
         inv_dim = routing.GetDimensionOrDie('InventarioCajas')
         vertedero_map = {v: k for k, v in nodos_vertederos.items()}
         
+        servicios_asignados = 0
+        
         for vehicle_id in range(routing.vehicles()):
             index = routing.Start(vehicle_id)
             ruta = []
             
             cajas_inicio = solution.Value(inv_dim.CumulVar(index))
             
-            # Saltar rutas vacías
             if routing.IsEnd(solution.Value(routing.NextVar(index))): continue
                 
             ruta.append({'Tipo': 'INICIO', 'Direccion': f'Base - SALIR CON {cajas_inicio} CAJAS', 'Concepto': 'INICIO', 'Hora Pide': '08:00', 'Material': '-'})
@@ -206,6 +202,7 @@ class OptimizadorVRP:
                         'Hora Pide': row.get('Hora Pide', 'Flexible'),
                         'lat': row['lat'], 'lon': row['lon']
                     })
+                    servicios_asignados += 1
                 elif node in vertedero_map:
                     nombre = vertedero_map[node]
                     ruta.append({'Cliente': f'VERTEDERO {nombre}', 'Tipo': 'VERTIDO', 'Direccion': 'Descarga', 'Concepto': 'IR A VERTEDERO', 'Hora Pide': '-', 'Material': '-'})
@@ -220,6 +217,11 @@ class OptimizadorVRP:
                         'num_servicios': len(ruta)-1, 'combustible_estimado_l': 0
                     }
                 }
+        
+        # Mostrar advertencia si se dejaron servicios sin asignar
+        if servicios_asignados < len(df):
+            st.warning(f"⚠️ Atención: Se han optimizado {servicios_asignados} de {len(df)} servicios. Algunos eran imposibles de encajar en el horario/ubicación.")
+            
         return rutas
 
     def exportar_excel(self, rutas, df_original):
