@@ -204,11 +204,62 @@ class OptimizadorVRPApp:
         st.markdown("Gestión Inteligente de Residuos y Rutas")
         st.markdown("---")
 
-    def mostrar_sidebar(self):
-        """Muestra la barra lateral de navegación"""
+       def mostrar_sidebar(self):
+        """Muestra la barra lateral de navegación interactiva"""
         with st.sidebar:
+            st.image("https://img.icons8.com/color/96/delivery--v1.png", width=80)
+            st.title("Gestión de Residuos")
+            st.divider()
+            
             st.header("Navegación")
             
+            # --- BOTONES DE NAVEGACIÓN ---
+            
+            # Paso 1: Cargar Datos
+            icono1 = '✅' if st.session_state.paso_actual > 1 else '1️⃣'
+            tipo_btn1 = "primary" if st.session_state.paso_actual == 1 else "secondary"
+            if st.button(f"{icono1} Cargar Datos", key="nav_p1", type=tipo_btn1, use_container_width=True):
+                st.session_state.paso_actual = 1
+                st.rerun()
+
+            # Paso 2: Geocodificar (Solo habilitado si hay datos cargados)
+            disabled_p2 = st.session_state.df_servicios is None
+            icono2 = '✅' if st.session_state.paso_actual > 2 else '2️⃣'
+            tipo_btn2 = "primary" if st.session_state.paso_actual == 2 else "secondary"
+            if st.button(f"{icono2} Geocodificar", key="nav_p2", type=tipo_btn2, disabled=disabled_p2, use_container_width=True):
+                st.session_state.paso_actual = 2
+                st.rerun()
+
+            # Paso 3: Optimizar (Solo habilitado si hay geocodificación)
+            disabled_p3 = st.session_state.df_geocodificado is None
+            icono3 = '✅' if st.session_state.paso_actual > 3 else '3️⃣'
+            tipo_btn3 = "primary" if st.session_state.paso_actual == 3 else "secondary"
+            if st.button(f"{icono3} Optimizar Rutas", key="nav_p3", type=tipo_btn3, disabled=disabled_p3, use_container_width=True):
+                st.session_state.paso_actual = 3
+                st.rerun()
+
+            # Paso 4: Enviar (Solo habilitado si hay rutas)
+            disabled_p4 = st.session_state.rutas_optimizadas is None
+            icono4 = '✅' if st.session_state.paso_actual > 4 else '4️⃣'
+            tipo_btn4 = "primary" if st.session_state.paso_actual >= 4 else "secondary"
+            if st.button(f"{icono4} Enviar Rutas", key="nav_p4", type=tipo_btn4, disabled=disabled_p4, use_container_width=True):
+                st.session_state.paso_actual = 4
+                st.rerun()
+            
+            st.divider()
+            
+            # Panel de estadísticas rápido
+            if st.session_state.df_servicios is not None:
+                st.caption(f"📦 Servicios: {len(st.session_state.df_servicios)}")
+            
+            st.divider()
+            
+            # Botón de Reset
+            if st.button("🔄 Reiniciar Todo", type="primary", use_container_width=True):
+                for key in list(st.session_state.keys()):
+                    del st.session_state[key]
+                st.session_state.paso_actual = 1
+                st.rerun()
             # Paso 1: Cargar
             paso1 = st.container()
             with paso1:
@@ -219,58 +270,7 @@ class OptimizadorVRPApp:
                 with col2:
                     st.markdown("**Cargar Datos**")
 
-            # Paso 2: Geocodificar
-            paso2 = st.container()
-            with paso2:
-                col1, col2 = st.columns([1, 4])
-                with col1:
-                    st.markdown(f"<h3>{'✅' if st.session_state.paso_actual > 2 else '2️⃣'}</h3>", 
-                               unsafe_allow_html=True)
-                with col2:
-                    st.markdown("**Geocodificar**")
-            
-            # Paso 3: Optimizar
-            paso3 = st.container()
-            with paso3:
-                col1, col2 = st.columns([1, 4])
-                with col1:
-                    st.markdown(f"<h3>{'✅' if st.session_state.paso_actual > 3 else '3️⃣'}</h3>", 
-                               unsafe_allow_html=True)
-                with col2:
-                    st.markdown("**Optimizar Rutas**")
-            
-            # Paso 4: Enviar
-            paso4 = st.container()
-            with paso4:
-                col1, col2 = st.columns([1, 4])
-                with col1:
-                    st.markdown(f"<h3>{'✅' if st.session_state.paso_actual > 4 else '4️⃣'}</h3>", 
-                               unsafe_allow_html=True)
-                with col2:
-                    st.markdown("**Enviar a Conductores**")
-            
-            st.divider()
-            
-            # Panel de estadísticas
-            st.markdown("### 📊 ESTADÍSTICAS")
-            
-            if st.session_state.df_servicios is not None:
-                df = st.session_state.df_servicios
-                st.metric("Servicios cargados", len(df))
-                
-                if 'Conductor' in df.columns:
-                    conductores = df['Conductor'].nunique()
-                    st.metric("Conductores asignados", conductores)
-            
-            st.divider()
-            
-            # Botón de reset
-            if st.button("🔄 Reiniciar Proceso", use_container_width=True):
-                for key in list(st.session_state.keys()):
-                    if key != 'paso_actual':
-                        del st.session_state[key]
-                st.session_state.paso_actual = 1
-                st.rerun()
+        
     
     def paso_1_cargar_datos(self):
         """Paso 1: Cargar datos de servicios y conductores"""
@@ -924,7 +924,8 @@ class OptimizadorVRPApp:
         for vehiculo, ruta in st.session_state.rutas_optimizadas.items():
             self.boton_whatsapp_ruta(vehiculo, ruta)
     
-    def panel_exportacion(self):
+  XPORTAR RESULTADOS
+def panel_exportacion(self):
         """Panel de exportación de resultados"""
         st.header("💾 EXPORTAR RESULTADOS")
         
@@ -932,7 +933,8 @@ class OptimizadorVRPApp:
             st.warning("⚠️ No hay rutas optimizadas para exportar")
             return
         
-        col1, col2, col3 = st.columns(3)
+        # Ahora usamos 4 columnas
+        col1, col2, col3, col4 = st.columns(4)
         
         with col1:
             # Exportar a Excel
@@ -975,7 +977,31 @@ class OptimizadorVRPApp:
                     mime="text/plain",
                     use_container_width=True
                 )
-    
+    with col4:
+            if st.button("🗺️ CSV My Maps", use_container_width=True):
+                # Generar CSV para Google My Maps
+                csv_data = "Name,Description,Latitude,Longitude\n"
+                
+                for vehiculo, ruta in st.session_state.rutas_optimizadas.items():
+                    for i, s in enumerate(ruta['servicios']):
+                        nombre = f"{vehiculo} - {i}. {s.get('Concepto', 'Punto')}"
+                        desc = f"{s.get('Material', '')} - {s.get('Direccion', '')} - {s.get('Hora Pide', '')}"
+                        lat = s.get('lat', 0)
+                        lon = s.get('lon', 0)
+                        
+                        if lat != 0 and lon != 0:
+                            # Limpiar comas para no romper el CSV
+                            nombre = nombre.replace(',', ' ')
+                            desc = desc.replace(',', ' ')
+                            csv_data += f"{nombre},{desc},{lat},{lon}\n"
+                
+                st.download_button(
+                    label="📥 Bajar CSV Maps",
+                    data=csv_data,
+                    file_name="importar_en_mymaps.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
     def generar_informe_completo(self):
         """Generar informe completo en texto"""
         informe = []
