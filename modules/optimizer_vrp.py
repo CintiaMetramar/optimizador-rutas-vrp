@@ -4,6 +4,7 @@ Algoritmo VRP Experto - VERSIÓN BLINDADA (100% Crash-Proof)
 - Nombres Reales de Conductores Activos.
 - Ventana de tiempo estricta matutina.
 - Máximo 3 servicios por conductor.
+- Sanitización de datos (Evita errores de celdas vacías en Excel).
 """
 
 import pandas as pd
@@ -46,15 +47,22 @@ class OptimizadorVRP:
             nodos.append({'tipo': 'BASE', 'coords': self.base['coords'], 'nombre': 'Base', 'demand_full': 0, 'demand_empty': 0, 'vertedero_req': 'CUALQUIERA'})
             
             for idx, row in df_clientes.iterrows():
+                # Sanitización estricta: forzar a string y manejar nulos de Excel
+                nombre_cliente = str(row.get('Cliente', '')).replace('nan', 'Sin Nombre')
+                direccion_cliente = str(row.get('Direccion', '')).replace('nan', '')
+                concepto_cliente = str(row.get('Concepto', '')).replace('nan', '')
+                material_cliente = str(row.get('Material', '')).replace('nan', '')
+                hora_pide_cliente = str(row.get('Hora Pide', '07:00')).replace('nan', '07:00')
+
                 nodos.append({
                     'tipo': 'CLIENTE',
                     'coords': (row['lat'], row['lon']),
-                    'nombre': row['Cliente'],
-                    'direccion': row['Direccion'],
-                    'concepto': row['Concepto'],
+                    'nombre': nombre_cliente,
+                    'direccion': direccion_cliente,
+                    'concepto': concepto_cliente,
                     'tipo_servicio': row['tipo_servicio'],
-                    'hora_pide': row.get('Hora Pide', '07:00'),
-                    'material': row.get('Material', ''),
+                    'hora_pide': hora_pide_cliente,
+                    'material': material_cliente,
                     'demand_full': int(row['demand_full']),   
                     'demand_empty': int(row['demand_empty']), 
                     'vertedero_req': row['vertedero_req'],
@@ -80,8 +88,7 @@ class OptimizadorVRP:
                 })
 
             # =========================================================
-            # BLOQUE BLINDADO: PRE-CÁLCULO DE MATRICES Y ARRAYS
-            # Esto evita que C++ sufra un cortocircuito pidiendo datos
+            # PRE-CÁLCULO DE MATRICES (Blindado contra fallos de C++)
             # =========================================================
             size = len(nodos)
             matriz_dist = [[0 for _ in range(size)] for _ in range(size)]
@@ -98,24 +105,20 @@ class OptimizadorVRP:
                             dist_val = 1000000
                             tiempo_val = 1000000
                             
-                        # Añadir penalizaciones directamente a la matriz
+                        # Penalización de vertederos
                         if nodos[i]['tipo'] == 'CLIENTE' and nodos[j]['tipo'] == 'VERTEDERO':
                             req = nodos[i].get('vertedero_req', 'CUALQUIERA')
                             v_id = nodos[j].get('vertedero_id')
                             if req != 'CUALQUIERA' and v_id != req:
-                                dist_val += 1000000 # Prohibir ir a este vertedero
+                                dist_val += 1000000 
                                 
                         matriz_dist[i][j] = dist_val
                         matriz_tiempo[i][j] = tiempo_val
 
-            # Arrays unidimensionales puros
             array_demand_full = [int(n.get('demand_full', 0)) for n in nodos]
             array_demand_empty = [int(n.get('demand_empty', 0)) for n in nodos]
             array_is_client = [1 if n['tipo'] == 'CLIENTE' else 0 for n in nodos]
 
-            # =========================================================
-            # MOTOR OR-TOOLS CON CALLBACKS ULTRA-RÁPIDOS Y SEGUROS
-            # =========================================================
             manager = pywrapcp.RoutingIndexManager(size, num_vehiculos, 0)
             routing = pywrapcp.RoutingModel(manager)
 
@@ -129,7 +132,7 @@ class OptimizadorVRP:
                 return matriz_tiempo[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
             
             time_callback_index = routing.RegisterTransitCallback(time_callback)
-            # 18000s = 5 horas de jornada. De 7:00 a 12:00.
+            # 18000s = 5 horas de jornada (7:00 a 12:00)
             routing.AddDimension(time_callback_index, 1800, 18000, False, "Tiempo")
 
             def count_client_callback(from_index):
@@ -154,7 +157,6 @@ class OptimizadorVRP:
             for v in range(num_vehiculos):
                 empty_dim.CumulVar(routing.Start(v)).SetRange(0, 5)
 
-            # Disjunctions (Opcionalidad de los vertederos para que no obligue a visitarlos todos)
             for i in range(1, size):
                 idx = manager.NodeToIndex(i)
                 if nodos[i]['tipo'] == 'VERTEDERO':
@@ -162,7 +164,6 @@ class OptimizadorVRP:
                 else:
                     routing.AddDisjunction([idx], 1000000)
 
-            # Búsqueda
             search_params = pywrapcp.DefaultRoutingSearchParameters()
             search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
             search_params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
@@ -173,7 +174,7 @@ class OptimizadorVRP:
             if solution:
                 return self._procesar_solucion(manager, routing, solution, nodos, nombres_conductores)
             else:
-                st.error("❌ No se encontró solución. Revisa si hay direcciones imposibles o si los 3 servicios superan la jornada matutina.")
+                st.error("❌ No se encontró solución. Revisa si hay direcciones imposibles o demasiados servicios.")
                 return {}
 
         except Exception as e:
@@ -181,7 +182,6 @@ class OptimizadorVRP:
             return {}
 
     def _procesar_conceptos(self, df):
-        """Traduce la operativa de Áridos y Reglas de Clientes"""
         def analizar(row):
             cliente = str(row.get('Cliente', '')).upper()
             material = str(row.get('Material', '')).upper()
@@ -258,18 +258,21 @@ class OptimizadorVRP:
                 hora_estimada = (datetime.strptime("07:00", "%H:%M") + timedelta(seconds=tiempo_seg)).strftime("%H:%M")
                 
                 if nodo['tipo'] == 'CLIENTE':
-                    hora_m = nodo['hora_pide']
-                    if len(ruta) == 1 and (hora_m == 'Flexible' or hora_m == ''):
+                    hora_m = str(nodo['hora_pide'])
+                    if len(ruta) == 1 and (hora_m.lower() == 'flexible' or hora_m == '' or hora_m == 'nan'):
                         hora_m = '07:00'
                         
                     tag_zbe = f" {nodo['zbe']}" if nodo['zbe'] else ""
                     
+                    # Forzamos todo a string para evitar fallos de float + str
+                    nombre_final = str(nodo['nombre']) + str(tag_zbe)
+                    
                     ruta.append({
-                        'Cliente': nodo['nombre'] + tag_zbe,
-                        'Direccion': nodo['direccion'],
-                        'Tipo': nodo['tipo_servicio'],
-                        'Concepto': nodo['concepto'],
-                        'Material': nodo['material'],
+                        'Cliente': nombre_final,
+                        'Direccion': str(nodo['direccion']),
+                        'Tipo': str(nodo['tipo_servicio']),
+                        'Concepto': str(nodo['concepto']),
+                        'Material': str(nodo['material']),
                         'Hora Pide': hora_m,
                         'Hora Estimada': hora_estimada,
                         'lat': nodo['coords'][0], 'lon': nodo['coords'][1]
@@ -288,9 +291,7 @@ class OptimizadorVRP:
                 index = solution.Value(routing.NextVar(index))
             
             if len(ruta) > 1:
-                # Extraer nombre protegiendo contra errores de índice
                 nombre_c = nombres_conductores[vehicle_id] if vehicle_id < len(nombres_conductores) else f"Conductor Extra {vehicle_id}"
-                
                 rutas[f"🚚 {nombre_c}"] = {
                     'servicios': ruta,
                     'estadisticas': {
