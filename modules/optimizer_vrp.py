@@ -1,9 +1,9 @@
 """
-Algoritmo VRP Experto - VERSIÓN DEFINITIVA ÁRIDOS Y HORARIOS
+Algoritmo VRP Experto - VERSIÓN CLIENTES Y COMERCIALES
+- Manejo Inteligente de Cliente 1 (Comercial) y Cliente 2 (Final).
 - Respeta estrictamente "Hora Pide" (Límite inferior bloqueado).
 - Restricción física de chasis: CargaSucia + CargaArido <= 1.
 - Nodos automáticos de "Base" para recarga de áridos.
-- Formato visual limpio con el Nombre del Cliente destacado.
 """
 
 import pandas as pd
@@ -29,9 +29,8 @@ class OptimizadorVRP:
         self.parametros = kwargs
 
     def parse_time_window(self, hora_str):
-        """Convierte la hora de texto en un rango estricto de segundos desde las 7:00"""
         if not hora_str or 'flex' in str(hora_str).lower() or 'nan' in str(hora_str).lower() or '-' in str(hora_str):
-            return 0, 18000 # Flexible: De 7:00 a 12:00
+            return 0, 18000 
         
         match = re.search(r'(\d{1,2})[:\.](\d{2})', str(hora_str))
         if match:
@@ -39,12 +38,8 @@ class OptimizadorVRP:
             if h < 7: h = 7 
             if h > 12: h = 12 
             
-            # Segundos exactos desde las 07:00
             segundos_desde_7 = (h - 7) * 3600 + m * 60
-            
-            # REGLA ESTRICTA: min_sec es la hora exacta (no se puede llegar antes)
             min_sec = segundos_desde_7
-            # Damos 1 hora de margen hacia adelante para que tenga viabilidad
             max_sec = min(18000, segundos_desde_7 + 3600) 
             return min_sec, max_sec
             
@@ -66,12 +61,9 @@ class OptimizadorVRP:
                 nombres_conductores = [f"Conductor {i+1}" for i in range(num_vehiculos)]
             
             nodos = []
-            # 0. BASE DE INICIO
             nodos.append({'tipo': 'BASE', 'coords': self.base['coords'], 'nombre': 'Base', 'demand_full': 0, 'demand_empty': 0, 'demand_arido': 0, 'vertedero_req': 'CUALQUIERA', 'hora_pide': ''})
             
-            # 1. CLIENTES
             for idx, row in df_clientes.iterrows():
-                nombre_cliente = str(row.get('Cliente', '')).replace('nan', 'Sin Nombre')
                 direccion_cliente = str(row.get('Direccion', '')).replace('nan', '')
                 concepto_cliente = str(row.get('Concepto', '')).replace('nan', '')
                 material_cliente = str(row.get('Material', '')).replace('nan', '')
@@ -80,7 +72,8 @@ class OptimizadorVRP:
                 nodos.append({
                     'tipo': 'CLIENTE',
                     'coords': (row['lat'], row['lon']),
-                    'nombre': nombre_cliente,
+                    'nombre': str(row.get('nombre_albaran', 'Sin Nombre')),
+                    'comercial': str(row.get('comercial', '')),
                     'direccion': direccion_cliente,
                     'concepto': concepto_cliente,
                     'tipo_servicio': row['tipo_servicio'],
@@ -97,7 +90,6 @@ class OptimizadorVRP:
             num_copias = max(len(df_clientes), num_vehiculos * 3)
             vertederos_keys = list(self.vertederos_reales.keys())
             
-            # 2. VERTEDEROS VIRTUALES (Para descargar escombro)
             for i in range(num_copias):
                 v_key = vertederos_keys[i % len(vertederos_keys)]
                 v_data = self.vertederos_reales[v_key]
@@ -113,7 +105,6 @@ class OptimizadorVRP:
                     'hora_pide': ''
                 })
 
-            # 3. BASES VIRTUALES DE RECARGA (Para ir a por Árido)
             for i in range(num_copias):
                 nodos.append({
                     'tipo': 'RECARGA_ARIDO',
@@ -122,7 +113,7 @@ class OptimizadorVRP:
                     'nombre': 'Planta Áridos',
                     'demand_full': 0, 
                     'demand_empty': 0,
-                    'demand_arido': 1, # AQUÍ GANA LA CARGA DE ÁRIDO
+                    'demand_arido': 1, 
                     'vertedero_req': 'CUALQUIERA',
                     'hora_pide': ''
                 })
@@ -140,7 +131,7 @@ class OptimizadorVRP:
                         try:
                             d = geodesic(nodos[i]['coords'], nodos[j]['coords']).meters
                             dist_val = int(d)
-                            tiempo_val = int(d / 11.1) + 1200 # +20 min servicio
+                            tiempo_val = int(d / 11.1) + 1200 
                         except Exception:
                             dist_val = 1000000; tiempo_val = 1000000
                             
@@ -171,7 +162,6 @@ class OptimizadorVRP:
             routing.AddDimension(time_callback_index, 3600, 18000, False, "Tiempo")
             time_dim = routing.GetDimensionOrDie("Tiempo")
 
-            # APLICAR HORAS ESTRICTAS
             for i in range(1, size):
                 if nodos[i]['tipo'] == 'CLIENTE':
                     idx = manager.NodeToIndex(i)
@@ -183,7 +173,6 @@ class OptimizadorVRP:
             client_count_index = routing.RegisterUnaryTransitCallback(count_client_callback)
             routing.AddDimension(client_count_index, 0, 3, True, "MaxServicios")
 
-            # GESTIÓN FÍSICA DE CARGAS
             def demand_full_callback(from_index):
                 return array_demand_full[manager.IndexToNode(from_index)]
             full_idx = routing.RegisterUnaryTransitCallback(demand_full_callback)
@@ -199,7 +188,6 @@ class OptimizadorVRP:
             empty_idx = routing.RegisterUnaryTransitCallback(demand_empty_callback)
             routing.AddDimension(empty_idx, 0, 5, False, "CajasVacias")
             
-            # REGLA DE CHASIS: Sucia + Árido NUNCA puede ser > 1
             solver = routing.solver()
             sucia_dim = routing.GetDimensionOrDie("CargaSucia")
             arido_dim = routing.GetDimensionOrDie("CargaArido")
@@ -211,7 +199,6 @@ class OptimizadorVRP:
 
             for v in range(num_vehiculos):
                 empty_dim.CumulVar(routing.Start(v)).SetRange(0, 5)
-                # Permitimos que salgan de la base ya cargados con árido a las 7:00
                 arido_dim.CumulVar(routing.Start(v)).SetRange(0, 1)
 
             for i in range(1, size):
@@ -231,7 +218,7 @@ class OptimizadorVRP:
             if solution:
                 return self._procesar_solucion(manager, routing, solution, nodos, nombres_conductores)
             else:
-                st.error("❌ No hay solución. O las horas son incompatibles físicamente, o no hay vertederos cerca para descargar el escombro antes de cargar el árido.")
+                st.error("❌ No hay solución. O las horas son incompatibles físicamente, o faltan vertederos cerca para descargar.")
                 return {}
 
         except Exception as e:
@@ -240,18 +227,35 @@ class OptimizadorVRP:
 
     def _procesar_conceptos(self, df):
         def analizar(row):
-            cliente = str(row.get('Cliente', '')).upper()
-            material = str(row.get('Material', '')).upper()
-            concepto = str(row.get('Concepto', '')).upper()
-            lat, lon = row.get('lat', 0), row.get('lon', 0)
+            # 1. Extracción de Cliente 1 (Comercial) y Cliente 2 (Final)
+            c1 = str(row.get('Cliente 1', row.get('Cliente', ''))).strip().upper()
+            c2 = str(row.get('Cliente 2', '')).strip().upper()
+            
+            if c1 == 'NAN': c1 = ''
+            if c2 == 'NAN': c2 = ''
+            
+            # El nombre del Albarán prioriza al Cliente 2 si existe
+            nombre_albaran = c2 if c2 else c1
+            if not nombre_albaran:
+                nombre_albaran = 'SIN NOMBRE'
+                
+            # Guardamos el comercial para informar al conductor en el WhatsApp
+            comercial = c1 if c2 else ""
+            
+            # Para decidir el vertedero evaluamos ambos para no perder la orden del comercial
+            cliente_contexto = c1 + " " + c2
             
             vertedero_req = 'CUALQUIERA'
-            if any(c in cliente for c in ['LICUAS', 'FCC', 'SANYAL', 'ACCIONA', 'TRADIVEL']):
+            if any(c in cliente_contexto for c in ['LICUAS', 'FCC', 'SANYAL', 'ACCIONA', 'TRADIVEL']):
                 vertedero_req = 'VALDEMINGOMEZ'
-            elif 'TRANSHELMUT' in cliente and 'TRADIVEL' not in cliente:
+            elif 'TRANSHELMUT' in cliente_contexto and 'TRADIVEL' not in cliente_contexto:
                 vertedero_req = 'DERSA'
 
+            lat, lon = row.get('lat', 0), row.get('lon', 0)
             zbe = "🟢 ZBE" if (40.39 < lat < 40.45 and -3.72 < lon < -3.66) else ""
+
+            material = str(row.get('Material', '')).upper()
+            concepto = str(row.get('Concepto', '')).upper()
 
             es_arido = any(a in material for a in ['ARIDO', 'ÁRIDO', 'RIO', 'MIGA', 'GRAVA', 'ZAHORRA'])
             es_basculado = 'BASCULADO' in material
@@ -261,38 +265,30 @@ class OptimizadorVRP:
             
             if es_arido:
                 if 'SUMINISTRO' in concepto:
-                    tipo = 'SUMINISTRO ÁRIDO'
-                    d_full = 0; d_empty = -1; d_arido = -1
+                    tipo = 'SUMINISTRO ÁRIDO'; d_full = 0; d_empty = -1; d_arido = -1
                 elif 'CAMBIO' in concepto:
-                    tipo = 'CAMBIO CON ÁRIDO'
-                    d_full = 1; d_empty = 0; d_arido = -1
+                    tipo = 'CAMBIO CON ÁRIDO'; d_full = 1; d_empty = 0; d_arido = -1
                 elif 'DEPOSITO' in concepto:
-                    tipo = 'DEPÓSITO ÁRIDO'
-                    d_full = 0; d_empty = 0; d_arido = -1
+                    tipo = 'DEPÓSITO ÁRIDO'; d_full = 0; d_empty = 0; d_arido = -1
                 elif 'RETIRADA' in concepto:
                     if es_basculado:
-                        tipo = 'RETIRADA ÁRIDO BASCULADO'
-                        d_full = 1; d_empty = -1; d_arido = -1
+                        tipo = 'RETIRADA ÁRIDO BASCULADO'; d_full = 1; d_empty = -1; d_arido = -1
                     else:
-                        tipo = 'RETIRADA ÁRIDO DEJA CAJA'
-                        d_full = 1; d_empty = 0; d_arido = -1
+                        tipo = 'RETIRADA ÁRIDO DEJA CAJA'; d_full = 1; d_empty = 0; d_arido = -1
             else:
                 if 'CAMBIO' in concepto:
-                    tipo = 'CAMBIO'
-                    d_full = 1; d_empty = 1; d_arido = 0
+                    tipo = 'CAMBIO'; d_full = 1; d_empty = 1; d_arido = 0
                 elif 'DEPOSITO' in concepto or 'ENTREGA' in concepto:
-                    tipo = 'DEPOSITO'
-                    d_full = 0; d_empty = 1; d_arido = 0
+                    tipo = 'DEPOSITO'; d_full = 0; d_empty = 1; d_arido = 0
                 elif 'RETIRADA' in concepto or 'RECOGIDA' in concepto:
-                    tipo = 'RETIRADA'
-                    d_full = 1; d_empty = 0; d_arido = 0
+                    tipo = 'RETIRADA'; d_full = 1; d_empty = 0; d_arido = 0
                 elif 'SUMINISTRO' in concepto:
-                    tipo = 'SUMINISTRO'
-                    d_full = 0; d_empty = -1; d_arido = 0
+                    tipo = 'SUMINISTRO'; d_full = 0; d_empty = -1; d_arido = 0
             
-            return pd.Series([tipo, d_full, d_empty, d_arido, vertedero_req, zbe])
+            return pd.Series([tipo, d_full, d_empty, d_arido, vertedero_req, zbe, nombre_albaran, comercial])
 
-        df[['tipo_servicio', 'demand_full', 'demand_empty', 'demand_arido', 'vertedero_req', 'zbe']] = df.apply(analizar, axis=1)
+        # Aseguramos que el apply devuelve las columnas exactas
+        df[['tipo_servicio', 'demand_full', 'demand_empty', 'demand_arido', 'vertedero_req', 'zbe', 'nombre_albaran', 'comercial']] = df.apply(analizar, axis=1)
         return df
 
     def _procesar_solucion(self, manager, routing, solution, nodos, nombres_conductores):
@@ -326,15 +322,15 @@ class OptimizadorVRP:
                     hora_m = str(nodo['hora_pide'])
                     tag_zbe = f" {nodo['zbe']}" if nodo['zbe'] else ""
                     
-                    # AQUÍ SE ARREGLA EL FORMATO DEL WHATSAPP Y EXCEL
                     nombre_formateado = f"{nodo['nombre']} {tag_zbe}".strip()
-                    concepto_formateado = f"CLIENTE: {nombre_formateado} - {nodo['tipo_servicio']}"
+                    nota_comercial = f" (Por: {nodo['comercial']})" if nodo.get('comercial') else ""
+                    concepto_formateado = f"CLIENTE: {nombre_formateado}{nota_comercial} - {nodo['tipo_servicio']}"
                     
                     ruta.append({
                         'Cliente': nombre_formateado,
                         'Direccion': str(nodo['direccion']),
                         'Tipo': str(nodo['tipo_servicio']),
-                        'Concepto': concepto_formateado, # Esto sale destacado en WhatsApp
+                        'Concepto': concepto_formateado,
                         'Material': str(nodo['material']),
                         'Hora Pide': hora_m,
                         'Hora Estimada': hora_estimada,
