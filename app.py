@@ -191,6 +191,15 @@ class OptimizadorVRPApp:
     def paso_1_cargar_datos(self):
         st.header("📥 PASO 1: CARGAR DATOS")
         tab1, tab2 = st.tabs(["📋 Servicios del Día", "👥 Gestión de Conductores"])
+uploaded_conductores = st.file_uploader("Subir Excel de conductores", type=['xlsx', 'xls'], key="upload_conductores")
+            if uploaded_conductores:
+                try:
+                    with st.spinner("Cargando conductores..."):
+                        conductores_df = self.conductor_manager.cargar_desde_excel(uploaded_conductores)
+                        st.session_state.df_conductores = conductores_df # <--- LÍNEA NUEVA IMPORTANTE
+                        st.session_state.conductores_cargados = True
+                        st.success(f"✅ {len(conductores_df)} conductores cargados")
+                        st.dataframe(conductores_df, use_container_width=True)
         
         with tab1:
             uploaded_file = st.file_uploader("Seleccionar archivo Excel", type=['xlsx', 'xls'], key="upload_servicios")
@@ -244,34 +253,58 @@ class OptimizadorVRPApp:
                 st.session_state.paso_actual = 3
                 st.rerun()
                 
-    def paso_3_optimizar(self):
+   def paso_3_optimizar(self):
         st.header("🔄 PASO 3: OPTIMIZAR RUTAS VRP")
         
         if st.session_state.df_geocodificado is None:
             st.warning("⚠️ Primero geocodifica las direcciones")
             return
             
-        col1, col2 = st.columns(2)
-        with col1:
+        st.subheader("👨‍✈️ Asignación de Conductores")
+        
+        # 1. Selector de Conductores
+        if hasattr(st.session_state, 'df_conductores') and st.session_state.df_conductores is not None:
+            # Buscar la columna que contenga el nombre (suele ser 'nombre' o 'Nombre')
+            col_nombre = [c for c in st.session_state.df_conductores.columns if 'nombre' in c.lower() or 'conductor' in c.lower()]
+            lista_nombres = st.session_state.df_conductores[col_nombre[0]].tolist() if col_nombre else [f"Conductor {i+1}" for i in range(len(st.session_state.df_conductores))]
+            
+            # Quitar nulos
+            lista_nombres = [str(n) for n in lista_nombres if str(n).strip() != 'nan']
+            
+            conductores_activos = st.multiselect(
+                "Selecciona los conductores que trabajarán mañana:",
+                options=lista_nombres,
+                default=lista_nombres, # Por defecto todos marcados
+                help="Desmarca a los que estén de vacaciones o de baja."
+            )
+            vehiculos = len(conductores_activos)
+        else:
+            st.warning("No has subido el Excel de Conductores. Usando asignación genérica.")
             vehiculos = st.number_input("Número de Vehículos", min_value=1, value=5)
-        with col2:
-            st.info("El algoritmo balanceará la carga para no saturar a los conductores.")
+            conductores_activos = None
 
+        st.info(f"🚚 Se van a optimizar rutas para **{vehiculos}** conductores activos.")
+
+        # 2. Botón de Ejecutar
         if st.button("🚀 EJECUTAR OPTIMIZACIÓN", type="primary", use_container_width=True):
-            with st.spinner("Calculando rutas óptimas (Máx 15 segundos)..."):
-                self.optimizer.configurar(vehiculos_c=vehiculos)
+            if vehiculos == 0:
+                st.error("❌ Debes seleccionar al menos un conductor.")
+                return
                 
-                # Ejecutar
+            with st.spinner("Calculando rutas óptimas..."):
+                # Le pasamos tanto el número como los nombres al optimizador
+                self.optimizer.configurar(vehiculos_c=vehiculos, nombres_conductores=conductores_activos)
+                
                 rutas = self.optimizer.optimizar(st.session_state.df_geocodificado)
                 
                 if rutas:
                     st.session_state.rutas_optimizadas = rutas
                     st.session_state.paso_actual = 4
-                    st.success(f"✅ Rutas generadas correctamente")
+                    st.success(f"✅ Rutas generadas correctamente para {len(rutas)} conductores")
                     self.mostrar_resumen_optimizacion(rutas)
                     self.mostrar_rutas_detalladas(rutas)
                 else:
-                    st.error("❌ No se pudieron generar rutas. Revisa las direcciones.")
+                    st.error("❌ No se pudieron generar rutas.")
 
     def mostrar_resumen_optimizacion(self, rutas):
         st.subheader("📊 RESUMEN")
