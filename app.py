@@ -191,15 +191,6 @@ class OptimizadorVRPApp:
     def paso_1_cargar_datos(self):
         st.header("📥 PASO 1: CARGAR DATOS")
         tab1, tab2 = st.tabs(["📋 Servicios del Día", "👥 Gestión de Conductores"])
-uploaded_conductores = st.file_uploader("Subir Excel de conductores", type=['xlsx', 'xls'], key="upload_conductores")
-            if uploaded_conductores:
-                try:
-                    with st.spinner("Cargando conductores..."):
-                        conductores_df = self.conductor_manager.cargar_desde_excel(uploaded_conductores)
-                        st.session_state.df_conductores = conductores_df # <--- LÍNEA NUEVA IMPORTANTE
-                        st.session_state.conductores_cargados = True
-                        st.success(f"✅ {len(conductores_df)} conductores cargados")
-                        st.dataframe(conductores_df, use_container_width=True)
         
         with tab1:
             uploaded_file = st.file_uploader("Seleccionar archivo Excel", type=['xlsx', 'xls'], key="upload_servicios")
@@ -227,6 +218,7 @@ uploaded_conductores = st.file_uploader("Subir Excel de conductores", type=['xls
                 try:
                     with st.spinner("Cargando conductores..."):
                         conductores_df = self.conductor_manager.cargar_desde_excel(uploaded_conductores)
+                        st.session_state.df_conductores = conductores_df # LÍNEA IMPORTANTE
                         st.session_state.conductores_cargados = True
                         st.success(f"✅ {len(conductores_df)} conductores cargados")
                         st.dataframe(conductores_df, use_container_width=True)
@@ -253,7 +245,7 @@ uploaded_conductores = st.file_uploader("Subir Excel de conductores", type=['xls
                 st.session_state.paso_actual = 3
                 st.rerun()
                 
-   def paso_3_optimizar(self):
+    def paso_3_optimizar(self):
         st.header("🔄 PASO 3: OPTIMIZAR RUTAS VRP")
         
         if st.session_state.df_geocodificado is None:
