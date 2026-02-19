@@ -1,9 +1,9 @@
 """
-Algoritmo VRP Experto para Cadenas (Skip Loaders) - Lógica Estricta
-- Inicio: Valdemingómez 7:00 AM.
-- Regla Basculación: CAMBIO o RETIRADA obligan a ir a Vertedero inmediatamente.
-- Gestión de Inventario: El cambio consume la última caja vacía.
-- Vertederos Virtuales: Permite múltiples viajes a descargar en el mismo día.
+Algoritmo VRP Experto (Planificación Tarde -> Ejecución 7:00 a 10:00 AM)
+- Ventana de tiempo estricta matutina.
+- Máximo 3 servicios por conductor.
+- Lógica avanzada de Áridos y ZBE.
+- Vertederos específicos (Dersa, Valdemingómez).
 """
 
 import pandas as pd
@@ -17,12 +17,12 @@ from datetime import datetime, timedelta
 class OptimizadorVRP:
     def __init__(self):
         self.parametros = {}
-        # Coordenadas reales
+        # Coordenadas reales (Ajusta Dersa si es necesario)
         self.vertederos_reales = {
             'LAGUNA': {'coords': (40.3460, -3.7007), 'nombre': 'Laguna del Marquesado'},
-            'VALDEMINGOMEZ': {'coords': (40.3186, -3.6017), 'nombre': 'Valdemingómez'}
+            'VALDEMINGOMEZ': {'coords': (40.3186, -3.6017), 'nombre': 'Valdemingómez'},
+            'DERSA': {'coords': (40.4330, -3.5000), 'nombre': 'Dersa (San Fernando)'} 
         }
-        # AHORA LA BASE ES VALDEMINGÓMEZ
         self.base = {'coords': (40.3186, -3.6017), 'nombre': 'Base Valdemingómez'} 
 
     def configurar(self, **kwargs):
@@ -30,28 +30,19 @@ class OptimizadorVRP:
 
     def optimizar(self, df_input):
         try:
-            # 1. Procesar lógica de negocio
             df = df_input.copy()
             df = self._procesar_conceptos(df)
             
-            # Filtrar válidos
             df_clientes = df[df['geocodificado'] == True].reset_index(drop=True)
             if len(df_clientes) == 0: 
                 st.warning("⚠️ No hay direcciones válidas.")
                 return {}
 
-            # 2. GENERAR NODOS (Clientes + Vertederos Virtuales)
-            # Para permitir que los camiones vayan muchas veces al vertedero,
-            # creamos "copias" virtuales de los vertederos.
             num_vehiculos = int(self.parametros.get('vehiculos_c', 20))
             
-            # Matriz maestra de nodos
             nodos = []
+            nodos.append({'tipo': 'BASE', 'coords': self.base['coords'], 'nombre': 'Base', 'demand_full': 0, 'demand_empty': 0, 'vertedero_req': 'CUALQUIERA'})
             
-            # Nodo 0: Base
-            nodos.append({'tipo': 'BASE', 'coords': self.base['coords'], 'nombre': 'Base', 'demand_full': 0, 'demand_empty': 0})
-            
-            # Nodos 1..N: Clientes
             for idx, row in df_clientes.iterrows():
                 nodos.append({
                     'tipo': 'CLIENTE',
@@ -60,108 +51,107 @@ class OptimizadorVRP:
                     'direccion': row['Direccion'],
                     'concepto': row['Concepto'],
                     'tipo_servicio': row['tipo_servicio'],
-                    'hora_pide': row.get('Hora Pide', 'Flexible'),
+                    'hora_pide': row.get('Hora Pide', '07:00'),
                     'material': row.get('Material', ''),
-                    'demand_full': row['demand_full'],   # 1 si genera caja sucia
-                    'demand_empty': row['demand_empty'], # 1 si gasta caja limpia
+                    'demand_full': row['demand_full'],   
+                    'demand_empty': row['demand_empty'], 
+                    'vertedero_req': row['vertedero_req'],
+                    'zbe': row['zbe'],
                     'id_original': idx
                 })
             
-            # Nodos N+1..M: Vertederos Virtuales
-            # Creamos suficientes copias para que no falten sitios donde descargar
-            # Estimamos: (Num Clientes / 2) copias de vertederos
-            num_copias = max(len(df_clientes), num_vehiculos * 4)
+            num_copias = max(len(df_clientes), num_vehiculos * 3)
+            vertederos_keys = list(self.vertederos_reales.keys())
             
-            indices_vertederos = []
             for i in range(num_copias):
-                # Alternamos entre Laguna y Valdemingómez
-                v_key = 'VALDEMINGOMEZ' if i % 2 == 0 else 'LAGUNA'
+                v_key = vertederos_keys[i % len(vertederos_keys)]
                 v_data = self.vertederos_reales[v_key]
                 
                 nodos.append({
                     'tipo': 'VERTEDERO',
+                    'vertedero_id': v_key,
                     'coords': v_data['coords'],
                     'nombre': v_data['nombre'],
-                    'demand_full': -1, # Descarga 1 caja llena
-                    'demand_empty': 0  # No afecta vacías (se asume que llega sin ellas)
+                    'demand_full': -1, 
+                    'demand_empty': 0,
+                    'vertedero_req': 'CUALQUIERA'
                 })
-                indices_vertederos.append(len(nodos) - 1)
 
-            # 3. Crear Matriz de Distancias y Tiempos
             matriz_dist, matriz_tiempo = self._crear_matrices(nodos)
             
-            # 4. Configurar OR-Tools
             manager = pywrapcp.RoutingIndexManager(len(nodos), num_vehiculos, 0)
             routing = pywrapcp.RoutingModel(manager)
 
-            # A. Coste Distancia
+            # A. Coste Distancia + RESTRICCIÓN DE VERTEDERO POR CLIENTE
             def distance_callback(from_index, to_index):
-                return matriz_dist[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
+                from_node = manager.IndexToNode(from_index)
+                to_node = manager.IndexToNode(to_index)
+                coste = matriz_dist[from_node][to_node]
+                
+                if nodos[from_node]['tipo'] == 'CLIENTE' and nodos[to_node]['tipo'] == 'VERTEDERO':
+                    req = nodos[from_node]['vertedero_req']
+                    if req != 'CUALQUIERA' and nodos[to_node]['vertedero_id'] != req:
+                        return coste + 1000000 
+                return coste
+
             transit_callback_index = routing.RegisterTransitCallback(distance_callback)
             routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
 
-            # B. TIEMPO (Jornada laboral desde las 7:00)
+            # B. LÍMITE DE 3 SERVICIOS MÁXIMO
+            def count_client_callback(from_index):
+                if nodos[manager.IndexToNode(from_index)]['tipo'] == 'CLIENTE':
+                    return 1
+                return 0
+            
+            client_count_index = routing.RegisterUnaryTransitCallback(count_client_callback)
+            routing.AddDimension(
+                client_count_index,
+                0,
+                3, # MÁXIMO 3 SERVICIOS POR CAMIÓN
+                True,
+                "MaxServicios"
+            )
+
+            # C. TIEMPO MATUTINO ESTRICTO (7:00 a 10:00/11:00)
             def time_callback(from_index, to_index):
-                # Viaje + 20 min servicio fijo
+                # Viaje + 20 min servicio (1200 seg)
                 return matriz_tiempo[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)] + 1200
             
             time_callback_index = routing.RegisterTransitCallback(time_callback)
             routing.AddDimension(
-                time_callback_index,
-                3600, # Espera
-                43200, # 12 horas max (7:00 a 19:00)
+                time_callback_index, 
+                1800, # Slack: Permitir hasta 30 mins de espera si llega muy pronto
+                14400, # Max jornada: 4 horas (14400 seg). De 7:00 a 11:00 tope absoluto.
                 False, 
                 "Tiempo"
             )
 
-            # C. GESTIÓN DE CAJAS LLENAS (Dirty Load)
-            # Capacidad = 1.
-            # Cambio/Retirada suman 1. Vertedero resta 1.
-            # ESTO OBLIGA A: Cambio (+1) -> Camión lleno (1/1) -> Solo puede ir a Vertedero (-1).
+            # D. GESTIÓN DE CAJAS LLENAS (Capacidad = 1)
             def demand_full_callback(from_index):
                 return nodos[manager.IndexToNode(from_index)]['demand_full']
 
             full_callback_index = routing.RegisterUnaryTransitCallback(demand_full_callback)
-            routing.AddDimensionWithVehicleCapacity(
-                full_callback_index,
-                0, # Slack
-                [1] * num_vehiculos, # CAPACIDAD MÁXIMA DE SUCIAS = 1
-                True, # Empezar a 0
-                "CargaSucia"
-            )
+            routing.AddDimensionWithVehicleCapacity(full_callback_index, 0, [1]*num_vehiculos, True, "CargaSucia")
 
-            # D. GESTIÓN DE CAJAS VACÍAS (Clean Stack)
-            # Capacidad = 5.
-            # Depósito/Cambio consumen 1.
+            # E. GESTIÓN DE CAJAS VACÍAS (Capacidad = 5)
             def demand_empty_callback(from_index):
                 return nodos[manager.IndexToNode(from_index)]['demand_empty']
 
             empty_callback_index = routing.RegisterUnaryTransitCallback(demand_empty_callback)
-            routing.AddDimensionWithVehicleCapacity(
-                empty_callback_index,
-                0,
-                [5] * num_vehiculos, # CAPACIDAD MÁXIMA VACÍAS = 5
-                False, # Permitir empezar con carga
-                "CajasVacias"
-            )
+            routing.AddDimensionWithVehicleCapacity(empty_callback_index, 0, [5]*num_vehiculos, False, "CajasVacias")
             
-            # Permitir salir de la base (Valdemingómez) con entre 0 y 5 cajas vacías
-            # El algoritmo decidirá el número óptimo
             empty_dim = routing.GetDimensionOrDie("CajasVacias")
             for v in range(num_vehiculos):
                 empty_dim.CumulVar(routing.Start(v)).SetRange(0, 5)
 
-            # E. Disjunctions (Opcionalidad) para Vertederos
-            # Los vertederos son opcionales: solo se visitan si hace falta descargar.
-            # Los clientes son obligatorios (penalización alta si se saltan).
+            # F. Opcionalidad de Vertederos y Obligación de Clientes
             for i in range(1, len(nodos)):
                 idx = manager.NodeToIndex(i)
                 if nodos[i]['tipo'] == 'VERTEDERO':
-                    routing.AddDisjunction([idx], 0) # Coste 0 por no visitarlo (es opcional)
+                    routing.AddDisjunction([idx], 0) 
                 else:
-                    routing.AddDisjunction([idx], 1000000) # Coste alto por no visitar cliente
+                    routing.AddDisjunction([idx], 1000000)
 
-            # 5. Resolver
             search_params = pywrapcp.DefaultRoutingSearchParameters()
             search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
             search_params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
@@ -172,7 +162,7 @@ class OptimizadorVRP:
             if solution:
                 return self._procesar_solucion(manager, routing, solution, nodos)
             else:
-                st.error("❌ No se encontró solución. Verifica si hay 'Cambios' imposibles sin vertedero cerca.")
+                st.error("❌ No se encontró solución. Es posible que 3 servicios en la franja de 7:00 a 10:00 sean inviables por distancia. Intenta subir los vehículos.")
                 return {}
 
         except Exception as e:
@@ -180,60 +170,89 @@ class OptimizadorVRP:
             return {}
 
     def _procesar_conceptos(self, df):
-        """Traduce la operativa Cintia a números (+1/-1)"""
+        """Traduce la operativa de Áridos y Reglas de Clientes"""
         def analizar(row):
-            texto = (str(row.get('Concepto', '')) + " " + str(row.get('Material', ''))).upper()
+            cliente = str(row.get('Cliente', '')).upper()
+            material = str(row.get('Material', '')).upper()
+            concepto = str(row.get('Concepto', '')).upper()
+            lat, lon = row.get('lat', 0), row.get('lon', 0)
+            
+            # Reglas de Vertedero por Cliente
+            vertedero_req = 'CUALQUIERA'
+            if any(c in cliente for c in ['LICUAS', 'FCC', 'SANYAL', 'ACCIONA', 'TRADIVEL']):
+                vertedero_req = 'VALDEMINGOMEZ'
+            elif 'TRANSHELMUT' in cliente and 'TRADIVEL' not in cliente:
+                vertedero_req = 'DERSA'
+
+            # Detección de ZBE (Madrid Central)
+            zbe = "🟢 ZBE" if (40.39 < lat < 40.45 and -3.72 < lon < -3.66) else ""
+
+            # Lógica de Áridos y Cajas
+            es_arido = any(a in material for a in ['ARIDO', 'ÁRIDO', 'RIO', 'MIGA', 'GRAVA', 'ZAHORRA'])
+            es_basculado = 'BASCULADO' in material
             
             tipo = 'RETIRADA'
-            d_full = 0 # ¿Genera caja sucia? (+1)
-            d_empty = 0 # ¿Gasta caja limpia? (+1 en OR-Tools logic es consumo si capacity es max)
+            d_full = 0 
+            d_empty = 0 
             
-            # NOTA: En OR-Tools 'Capacity' con 'UnaryTransitCallback' positivo acumula uso.
-            # Capacidad 5. Depósito consume 1 hueco? No, Depósito baja el inventario.
-            # Vamos a modelarlo como: Capacidad = 5. Inicio con 5. Depósito demanda 1.
+            if es_arido:
+                if 'SUMINISTRO' in concepto:
+                    tipo = 'SUMINISTRO ÁRIDO'
+                    d_full = 0
+                    d_empty = -1 
+                elif 'CAMBIO' in concepto:
+                    tipo = 'CAMBIO CON ÁRIDO'
+                    d_full = 1   
+                    d_empty = 1  
+                elif 'DEPOSITO' in concepto:
+                    tipo = 'DEPÓSITO ÁRIDO'
+                    d_full = 0
+                    d_empty = 1  
+                elif 'RETIRADA' in concepto:
+                    if es_basculado:
+                        tipo = 'RETIRADA ÁRIDO (BASCULADO)'
+                        d_full = 1   
+                        d_empty = -1 
+                    else:
+                        tipo = 'RETIRADA ÁRIDO (DEJA CAJA)'
+                        d_full = 1   
+                        d_empty = 1  
+            else:
+                if 'CAMBIO' in concepto:
+                    tipo = 'CAMBIO'
+                    d_full = 1; d_empty = 1
+                elif 'DEPOSITO' in concepto or 'ENTREGA' in concepto:
+                    tipo = 'DEPOSITO'
+                    d_full = 0; d_empty = 1
+                elif 'RETIRADA' in concepto or 'RECOGIDA' in concepto:
+                    tipo = 'RETIRADA'
+                    d_full = 1; d_empty = 0
+                elif 'SUMINISTRO' in concepto:
+                    tipo = 'SUMINISTRO'
+                    d_full = 0; d_empty = -1
             
-            if 'SUMINISTRO' in texto or 'ARIDO' in texto:
-                tipo = 'SUMINISTRO'
-                d_full = 0
-                d_empty = -1 # Genera una vacía (recupera inventario)
-            elif 'CAMBIO' in texto:
-                tipo = 'CAMBIO'
-                d_full = 1   # Genera sucia (STOP -> Vertedero)
-                d_empty = 1  # Gasta limpia
-            elif 'DEPOSITO' in texto or 'ENTREGA' in texto:
-                tipo = 'DEPOSITO'
-                d_full = 0
-                d_empty = 1  # Gasta limpia
-            elif 'RETIRADA' in texto:
-                tipo = 'RETIRADA'
-                d_full = 1   # Genera sucia (STOP -> Vertedero)
-                d_empty = 0  # No gasta limpia (se la lleva)
-            
-            return pd.Series([tipo, d_full, d_empty])
+            return pd.Series([tipo, d_full, d_empty, vertedero_req, zbe])
 
-        df[['tipo_servicio', 'demand_full', 'demand_empty']] = df.apply(analizar, axis=1)
+        df[['tipo_servicio', 'demand_full', 'demand_empty', 'vertedero_req', 'zbe']] = df.apply(analizar, axis=1)
         return df
 
     def _crear_matrices(self, nodos):
         size = len(nodos)
         coords = [n['coords'] for n in nodos]
-        
         matriz_dist = np.zeros((size, size))
         matriz_tiempo = np.zeros((size, size))
         
-        # Cálculo optimizado con numpy (evitar bucles lentos)
-        # Para 135 servicios + vertederos es pesado, usamos aproximación rápida primero
         for i in range(size):
             for j in range(size):
                 if i != j:
                     try:
                         d = geodesic(coords[i], coords[j]).meters
                         matriz_dist[i][j] = int(d)
-                        matriz_tiempo[i][j] = int(d / 11.1) # 40 km/h
+                        # Cálculo a 40 km/h para simular el tráfico madrileño real de la mañana
+                        matriz_tiempo[i][j] = int(d / 11.1) 
                     except:
                         matriz_dist[i][j] = 1000000
                         matriz_tiempo[i][j] = 1000000
-                        
         return matriz_dist, matriz_tiempo
 
     def _procesar_solucion(self, manager, routing, solution, nodos):
@@ -245,40 +264,39 @@ class OptimizadorVRP:
             index = routing.Start(vehicle_id)
             ruta = []
             
-            # Cajas iniciales
             cajas_inicio = solution.Value(empty_dim.CumulVar(index))
-            
-            # Saltar rutas vacías
             if routing.IsEnd(solution.Value(routing.NextVar(index))): continue
             
-            # Inicio Jornada
             ruta.append({
                 'Tipo': 'INICIO', 
-                'Direccion': f'Salida Valdemingómez (Carga: {cajas_inicio} vacías)', 
-                'Concepto': 'INICIO JORNADA', 
+                'Direccion': f'Base Valdemingómez (Sale con {cajas_inicio} vacías)', 
+                'Concepto': 'INICIO 07:00', 
                 'Hora Pide': '07:00', 
                 'Material': '-'
             })
-            
-            hora_actual = datetime.strptime("07:00", "%H:%M")
             
             while not routing.IsEnd(index):
                 node_idx = manager.IndexToNode(index)
                 nodo = nodos[node_idx]
                 
-                # Obtener tiempo acumulado (en segundos)
                 tiempo_seg = solution.Value(time_dim.CumulVar(index))
                 hora_estimada = (datetime.strptime("07:00", "%H:%M") + timedelta(seconds=tiempo_seg)).strftime("%H:%M")
                 
                 if nodo['tipo'] == 'CLIENTE':
+                    hora_m = nodo['hora_pide']
+                    if len(ruta) == 1 and (hora_m == 'Flexible' or hora_m == ''):
+                        hora_m = '07:00'
+                        
+                    tag_zbe = f" {nodo['zbe']}" if nodo['zbe'] else ""
+                    
                     ruta.append({
-                        'Cliente': nodo['nombre'],
+                        'Cliente': nodo['nombre'] + tag_zbe,
                         'Direccion': nodo['direccion'],
                         'Tipo': nodo['tipo_servicio'],
                         'Concepto': nodo['concepto'],
                         'Material': nodo['material'],
-                        'Hora Pide': nodo['hora_pide'], # Hora solicitada
-                        'Hora Estimada': hora_estimada, # Hora calculada
+                        'Hora Pide': hora_m,
+                        'Hora Estimada': hora_estimada,
                         'lat': nodo['coords'][0], 'lon': nodo['coords'][1]
                     })
                 elif nodo['tipo'] == 'VERTEDERO':
@@ -299,7 +317,8 @@ class OptimizadorVRP:
                     'servicios': ruta,
                     'estadisticas': {
                         'distancia_total_km': 0, 'tiempo_total_min': 0, 
-                        'num_servicios': len(ruta)-1, 'combustible_estimado_l': 0
+                        'num_servicios': sum(1 for s in ruta if s['Tipo'] not in ['INICIO', 'VERTIDO']), 
+                        'combustible_estimado_l': 0
                     }
                 }
         return rutas
