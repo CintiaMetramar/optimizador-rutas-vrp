@@ -1,10 +1,11 @@
 """
-Algoritmo VRP Experto - VERSIÓN BLINDADA (100% Crash-Proof)
-- Pre-calcula todas las matrices para evitar errores C++ / Python.
+Algoritmo VRP Experto - VERSIÓN BLINDADA Y HORARIOS ESTRICTOS
+- Respeta "Hora Pide" (Time Windows matemáticos).
+- Semántica de Ciclos: Vertederos como Origen/Fin de viaje, no como servicios.
+- Pre-calcula todas las matrices (100% Crash-Proof).
 - Nombres Reales de Conductores Activos.
-- Ventana de tiempo estricta matutina.
+- Ventana de tiempo matutina (7:00 a 12:00).
 - Máximo 3 servicios por conductor.
-- Sanitización de datos (Evita errores de celdas vacías en Excel).
 """
 
 import pandas as pd
@@ -13,6 +14,7 @@ from ortools.constraint_solver import pywrapcp
 from geopy.distance import geodesic
 import streamlit as st
 from datetime import datetime, timedelta
+import re
 
 class OptimizadorVRP:
     def __init__(self):
@@ -27,6 +29,27 @@ class OptimizadorVRP:
 
     def configurar(self, **kwargs):
         self.parametros = kwargs
+
+    def parse_time_window(self, hora_str):
+        """Convierte la hora de texto en un rango de segundos matemáticos desde las 7:00"""
+        if not hora_str or 'flex' in str(hora_str).lower() or 'nan' in str(hora_str).lower() or '-' in str(hora_str):
+            return 0, 18000 # Rango completo de 7:00 a 12:00 (5 horas = 18000 seg)
+        
+        match = re.search(r'(\d{1,2})[:\.](\d{2})', str(hora_str))
+        if match:
+            h, m = int(match.group(1)), int(match.group(2))
+            if h < 7: h = 7 # Si piden antes de las 7, asumimos primera hora
+            if h > 12: h = 12 # Si piden tarde, ajustamos al límite del turno
+            
+            # Convertir a segundos desde las 07:00
+            segundos_desde_7 = (h - 7) * 3600 + m * 60
+            
+            # Damos una ventana de flexibilidad: pueden llegar 30 min antes o 45 min después
+            min_sec = max(0, segundos_desde_7 - 1800)
+            max_sec = min(18000, segundos_desde_7 + 2700)
+            return min_sec, max_sec
+            
+        return 0, 18000
 
     def optimizar(self, df_input):
         try:
@@ -44,15 +67,14 @@ class OptimizadorVRP:
                 nombres_conductores = [f"Conductor {i+1}" for i in range(num_vehiculos)]
             
             nodos = []
-            nodos.append({'tipo': 'BASE', 'coords': self.base['coords'], 'nombre': 'Base', 'demand_full': 0, 'demand_empty': 0, 'vertedero_req': 'CUALQUIERA'})
+            nodos.append({'tipo': 'BASE', 'coords': self.base['coords'], 'nombre': 'Base', 'demand_full': 0, 'demand_empty': 0, 'vertedero_req': 'CUALQUIERA', 'hora_pide': ''})
             
             for idx, row in df_clientes.iterrows():
-                # Sanitización estricta: forzar a string y manejar nulos de Excel
                 nombre_cliente = str(row.get('Cliente', '')).replace('nan', 'Sin Nombre')
                 direccion_cliente = str(row.get('Direccion', '')).replace('nan', '')
                 concepto_cliente = str(row.get('Concepto', '')).replace('nan', '')
                 material_cliente = str(row.get('Material', '')).replace('nan', '')
-                hora_pide_cliente = str(row.get('Hora Pide', '07:00')).replace('nan', '07:00')
+                hora_pide_cliente = str(row.get('Hora Pide', 'Flexible')).replace('nan', 'Flexible')
 
                 nodos.append({
                     'tipo': 'CLIENTE',
@@ -84,11 +106,12 @@ class OptimizadorVRP:
                     'nombre': v_data['nombre'],
                     'demand_full': -1, 
                     'demand_empty': 0,
-                    'vertedero_req': 'CUALQUIERA'
+                    'vertedero_req': 'CUALQUIERA',
+                    'hora_pide': ''
                 })
 
             # =========================================================
-            # PRE-CÁLCULO DE MATRICES (Blindado contra fallos de C++)
+            # PRE-CÁLCULO DE MATRICES 
             # =========================================================
             size = len(nodos)
             matriz_dist = [[0 for _ in range(size)] for _ in range(size)]
@@ -105,7 +128,6 @@ class OptimizadorVRP:
                             dist_val = 1000000
                             tiempo_val = 1000000
                             
-                        # Penalización de vertederos
                         if nodos[i]['tipo'] == 'CLIENTE' and nodos[j]['tipo'] == 'VERTEDERO':
                             req = nodos[i].get('vertedero_req', 'CUALQUIERA')
                             v_id = nodos[j].get('vertedero_id')
@@ -132,8 +154,15 @@ class OptimizadorVRP:
                 return matriz_tiempo[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
             
             time_callback_index = routing.RegisterTransitCallback(time_callback)
-            # 18000s = 5 horas de jornada (7:00 a 12:00)
-            routing.AddDimension(time_callback_index, 1800, 18000, False, "Tiempo")
+            routing.AddDimension(time_callback_index, 3600, 18000, False, "Tiempo")
+            time_dim = routing.GetDimensionOrDie("Tiempo")
+
+            # APLICAR VENTANAS DE TIEMPO (Hora Pide) A LOS CLIENTES
+            for i in range(1, size):
+                if nodos[i]['tipo'] == 'CLIENTE':
+                    idx = manager.NodeToIndex(i)
+                    min_s, max_s = self.parse_time_window(nodos[i]['hora_pide'])
+                    time_dim.CumulVar(idx).SetRange(int(min_s), int(max_s))
 
             def count_client_callback(from_index):
                 return array_is_client[manager.IndexToNode(from_index)]
@@ -167,14 +196,14 @@ class OptimizadorVRP:
             search_params = pywrapcp.DefaultRoutingSearchParameters()
             search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
             search_params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-            search_params.time_limit.seconds = 30 
+            search_params.time_limit.seconds = 35 
 
             solution = routing.SolveWithParameters(search_params)
 
             if solution:
                 return self._procesar_solucion(manager, routing, solution, nodos, nombres_conductores)
             else:
-                st.error("❌ No se encontró solución. Revisa si hay direcciones imposibles o demasiados servicios.")
+                st.error("❌ No se encontró solución. Es probable que las 'Horas Pide' de algunos clientes se solapen y sea físicamente imposible hacerlos todos en tiempo.")
                 return {}
 
         except Exception as e:
@@ -242,10 +271,11 @@ class OptimizadorVRP:
             cajas_inicio = solution.Value(empty_dim.CumulVar(index))
             if routing.IsEnd(solution.Value(routing.NextVar(index))): continue
             
+            # ORIGEN DEL VIAJE
             ruta.append({
                 'Tipo': 'INICIO', 
                 'Direccion': f'Base Valdemingómez (Sale con {cajas_inicio} vacías)', 
-                'Concepto': 'INICIO 07:00', 
+                'Concepto': '🏁 ORIGEN DEL VIAJE', 
                 'Hora Pide': '07:00', 
                 'Material': '-'
             })
@@ -259,30 +289,26 @@ class OptimizadorVRP:
                 
                 if nodo['tipo'] == 'CLIENTE':
                     hora_m = str(nodo['hora_pide'])
-                    if len(ruta) == 1 and (hora_m.lower() == 'flexible' or hora_m == '' or hora_m == 'nan'):
-                        hora_m = '07:00'
-                        
                     tag_zbe = f" {nodo['zbe']}" if nodo['zbe'] else ""
-                    
-                    # Forzamos todo a string para evitar fallos de float + str
                     nombre_final = str(nodo['nombre']) + str(tag_zbe)
                     
                     ruta.append({
                         'Cliente': nombre_final,
                         'Direccion': str(nodo['direccion']),
                         'Tipo': str(nodo['tipo_servicio']),
-                        'Concepto': str(nodo['concepto']),
+                        'Concepto': f"📍 PUNTO INTERMEDIO: {str(nodo['concepto'])}",
                         'Material': str(nodo['material']),
                         'Hora Pide': hora_m,
                         'Hora Estimada': hora_estimada,
                         'lat': nodo['coords'][0], 'lon': nodo['coords'][1]
                     })
                 elif nodo['tipo'] == 'VERTEDERO':
+                    # FIN DEL VIAJE
                     ruta.append({
                         'Cliente': f"VERTEDERO {nodo['nombre']}", 
                         'Tipo': 'VERTIDO', 
-                        'Direccion': 'BASCULAR', 
-                        'Concepto': 'IR A VERTEDERO', 
+                        'Direccion': 'Descarga y fin de ciclo', 
+                        'Concepto': '🏁 FIN DE VIAJE (Descarga)', 
                         'Hora Pide': '-',
                         'Hora Estimada': hora_estimada,
                         'Material': '-'
