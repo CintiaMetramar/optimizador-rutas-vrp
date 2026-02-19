@@ -1,5 +1,6 @@
 """
 Algoritmo VRP Experto (Planificación Tarde -> Ejecución 7:00 a 10:00 AM)
+- Nombres Reales de Conductores Activos.
 - Ventana de tiempo estricta matutina.
 - Máximo 3 servicios por conductor.
 - Lógica avanzada de Áridos y ZBE.
@@ -17,7 +18,7 @@ from datetime import datetime, timedelta
 class OptimizadorVRP:
     def __init__(self):
         self.parametros = {}
-        # Coordenadas reales (Ajusta Dersa si es necesario)
+        # Coordenadas reales
         self.vertederos_reales = {
             'LAGUNA': {'coords': (40.3460, -3.7007), 'nombre': 'Laguna del Marquesado'},
             'VALDEMINGOMEZ': {'coords': (40.3186, -3.6017), 'nombre': 'Valdemingómez'},
@@ -39,6 +40,10 @@ class OptimizadorVRP:
                 return {}
 
             num_vehiculos = int(self.parametros.get('vehiculos_c', 20))
+            # Extraer nombres si están disponibles
+            nombres_conductores = self.parametros.get('nombres_conductores')
+            if not nombres_conductores or len(nombres_conductores) != num_vehiculos:
+                nombres_conductores = [f"Vehículo {i+1}" for i in range(num_vehiculos)]
             
             nodos = []
             nodos.append({'tipo': 'BASE', 'coords': self.base['coords'], 'nombre': 'Base', 'demand_full': 0, 'demand_empty': 0, 'vertedero_req': 'CUALQUIERA'})
@@ -91,8 +96,9 @@ class OptimizadorVRP:
                 if nodos[from_node]['tipo'] == 'CLIENTE' and nodos[to_node]['tipo'] == 'VERTEDERO':
                     req = nodos[from_node]['vertedero_req']
                     if req != 'CUALQUIERA' and nodos[to_node]['vertedero_id'] != req:
-                        return coste + 1000000 
-                return coste
+                        return int(coste + 1000000) 
+                
+                return int(coste) 
 
             transit_callback_index = routing.RegisterTransitCallback(distance_callback)
             routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
@@ -112,30 +118,26 @@ class OptimizadorVRP:
                 "MaxServicios"
             )
 
-            # C. TIEMPO MATUTINO ESTRICTO (7:00 a 10:00/11:00)
+            # C. TIEMPO MATUTINO ESTRICTO
             def time_callback(from_index, to_index):
-                # Viaje + 20 min servicio (1200 seg)
-                return matriz_tiempo[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)] + 1200
+                from_n = manager.IndexToNode(from_index)
+                to_n = manager.IndexToNode(to_index)
+                return int(matriz_tiempo[from_n][to_n] + 1200)
             
             time_callback_index = routing.RegisterTransitCallback(time_callback)
-            routing.AddDimension(
-                time_callback_index, 
-                1800, # Slack: Permitir hasta 30 mins de espera si llega muy pronto
-                14400, # Max jornada: 4 horas (14400 seg). De 7:00 a 11:00 tope absoluto.
-                False, 
-                "Tiempo"
-            )
+            # Damos 5 horas de margen (7:00 a 12:00 = 18000s) para que haya menos errores
+            routing.AddDimension(time_callback_index, 1800, 18000, False, "Tiempo")
 
-            # D. GESTIÓN DE CAJAS LLENAS (Capacidad = 1)
+            # D. GESTIÓN DE CAJAS LLENAS
             def demand_full_callback(from_index):
-                return nodos[manager.IndexToNode(from_index)]['demand_full']
+                return int(nodos[manager.IndexToNode(from_index)]['demand_full'])
 
             full_callback_index = routing.RegisterUnaryTransitCallback(demand_full_callback)
             routing.AddDimensionWithVehicleCapacity(full_callback_index, 0, [1]*num_vehiculos, True, "CargaSucia")
 
-            # E. GESTIÓN DE CAJAS VACÍAS (Capacidad = 5)
+            # E. GESTIÓN DE CAJAS VACÍAS
             def demand_empty_callback(from_index):
-                return nodos[manager.IndexToNode(from_index)]['demand_empty']
+                return int(nodos[manager.IndexToNode(from_index)]['demand_empty'])
 
             empty_callback_index = routing.RegisterUnaryTransitCallback(demand_empty_callback)
             routing.AddDimensionWithVehicleCapacity(empty_callback_index, 0, [5]*num_vehiculos, False, "CajasVacias")
@@ -160,9 +162,9 @@ class OptimizadorVRP:
             solution = routing.SolveWithParameters(search_params)
 
             if solution:
-                return self._procesar_solucion(manager, routing, solution, nodos)
+                return self._procesar_solucion(manager, routing, solution, nodos, nombres_conductores)
             else:
-                st.error("❌ No se encontró solución. Es posible que 3 servicios en la franja de 7:00 a 10:00 sean inviables por distancia. Intenta subir los vehículos.")
+                st.error("❌ No se encontró solución. Es posible que 3 servicios por conductor no sean suficientes o las distancias excedan el horario.")
                 return {}
 
         except Exception as e:
@@ -177,17 +179,14 @@ class OptimizadorVRP:
             concepto = str(row.get('Concepto', '')).upper()
             lat, lon = row.get('lat', 0), row.get('lon', 0)
             
-            # Reglas de Vertedero por Cliente
             vertedero_req = 'CUALQUIERA'
             if any(c in cliente for c in ['LICUAS', 'FCC', 'SANYAL', 'ACCIONA', 'TRADIVEL']):
                 vertedero_req = 'VALDEMINGOMEZ'
             elif 'TRANSHELMUT' in cliente and 'TRADIVEL' not in cliente:
                 vertedero_req = 'DERSA'
 
-            # Detección de ZBE (Madrid Central)
             zbe = "🟢 ZBE" if (40.39 < lat < 40.45 and -3.72 < lon < -3.66) else ""
 
-            # Lógica de Áridos y Cajas
             es_arido = any(a in material for a in ['ARIDO', 'ÁRIDO', 'RIO', 'MIGA', 'GRAVA', 'ZAHORRA'])
             es_basculado = 'BASCULADO' in material
             
@@ -197,39 +196,25 @@ class OptimizadorVRP:
             
             if es_arido:
                 if 'SUMINISTRO' in concepto:
-                    tipo = 'SUMINISTRO ÁRIDO'
-                    d_full = 0
-                    d_empty = -1 
+                    tipo = 'SUMINISTRO ÁRIDO'; d_full = 0; d_empty = -1 
                 elif 'CAMBIO' in concepto:
-                    tipo = 'CAMBIO CON ÁRIDO'
-                    d_full = 1   
-                    d_empty = 1  
+                    tipo = 'CAMBIO CON ÁRIDO'; d_full = 1; d_empty = 1  
                 elif 'DEPOSITO' in concepto:
-                    tipo = 'DEPÓSITO ÁRIDO'
-                    d_full = 0
-                    d_empty = 1  
+                    tipo = 'DEPÓSITO ÁRIDO'; d_full = 0; d_empty = 1  
                 elif 'RETIRADA' in concepto:
                     if es_basculado:
-                        tipo = 'RETIRADA ÁRIDO (BASCULADO)'
-                        d_full = 1   
-                        d_empty = -1 
+                        tipo = 'RETIRADA ÁRIDO (BASCULADO)'; d_full = 1; d_empty = -1 
                     else:
-                        tipo = 'RETIRADA ÁRIDO (DEJA CAJA)'
-                        d_full = 1   
-                        d_empty = 1  
+                        tipo = 'RETIRADA ÁRIDO (DEJA CAJA)'; d_full = 1; d_empty = 1  
             else:
                 if 'CAMBIO' in concepto:
-                    tipo = 'CAMBIO'
-                    d_full = 1; d_empty = 1
+                    tipo = 'CAMBIO'; d_full = 1; d_empty = 1
                 elif 'DEPOSITO' in concepto or 'ENTREGA' in concepto:
-                    tipo = 'DEPOSITO'
-                    d_full = 0; d_empty = 1
+                    tipo = 'DEPOSITO'; d_full = 0; d_empty = 1
                 elif 'RETIRADA' in concepto or 'RECOGIDA' in concepto:
-                    tipo = 'RETIRADA'
-                    d_full = 1; d_empty = 0
+                    tipo = 'RETIRADA'; d_full = 1; d_empty = 0
                 elif 'SUMINISTRO' in concepto:
-                    tipo = 'SUMINISTRO'
-                    d_full = 0; d_empty = -1
+                    tipo = 'SUMINISTRO'; d_full = 0; d_empty = -1
             
             return pd.Series([tipo, d_full, d_empty, vertedero_req, zbe])
 
@@ -239,8 +224,8 @@ class OptimizadorVRP:
     def _crear_matrices(self, nodos):
         size = len(nodos)
         coords = [n['coords'] for n in nodos]
-        matriz_dist = np.zeros((size, size))
-        matriz_tiempo = np.zeros((size, size))
+        matriz_dist = np.zeros((size, size), dtype=int)
+        matriz_tiempo = np.zeros((size, size), dtype=int)
         
         for i in range(size):
             for j in range(size):
@@ -248,14 +233,13 @@ class OptimizadorVRP:
                     try:
                         d = geodesic(coords[i], coords[j]).meters
                         matriz_dist[i][j] = int(d)
-                        # Cálculo a 40 km/h para simular el tráfico madrileño real de la mañana
                         matriz_tiempo[i][j] = int(d / 11.1) 
                     except:
                         matriz_dist[i][j] = 1000000
                         matriz_tiempo[i][j] = 1000000
         return matriz_dist, matriz_tiempo
 
-    def _procesar_solucion(self, manager, routing, solution, nodos):
+    def _procesar_solucion(self, manager, routing, solution, nodos, nombres_conductores):
         rutas = {}
         empty_dim = routing.GetDimensionOrDie('CajasVacias')
         time_dim = routing.GetDimensionOrDie('Tiempo')
@@ -313,7 +297,9 @@ class OptimizadorVRP:
                 index = solution.Value(routing.NextVar(index))
             
             if len(ruta) > 1:
-                rutas[f"Vehículo {vehicle_id + 1}"] = {
+                # AQUÍ APLICAMOS EL NOMBRE DEL CONDUCTOR
+                nombre_conductor = nombres_conductores[vehicle_id]
+                rutas[f"🚚 {nombre_conductor}"] = {
                     'servicios': ruta,
                     'estadisticas': {
                         'distancia_total_km': 0, 'tiempo_total_min': 0, 
