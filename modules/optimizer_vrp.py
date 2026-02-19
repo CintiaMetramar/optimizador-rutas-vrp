@@ -1,10 +1,9 @@
 """
-Algoritmo VRP Experto - VERSIÓN DEFINITIVA B2B Y ANTI-FALLOS
-- Inventario Físico Real de Cajas (Soluciona CP Solver Fail).
-- Manejo Inteligente de Cliente 1 (Comercial) y Cliente 2 (Final).
-- Respeta estrictamente "Hora Pide" (Límite inferior bloqueado).
-- Restricción física de chasis: CargaSucia + CargaArido <= 1.
-- Nodos automáticos de "Base" para recarga de áridos.
+Algoritmo VRP Experto - LOGÍSTICA DE OBRA REAL
+- Solución Anti-Fail: Soft Time Windows (Fases de Mañana)
+- 0 Esperas: Límite de slack (espera) a 15 min. No hay camiones parados.
+- Inventario Físico y Chasis: (Sucia + Árido <= 1).
+- Priorización Comercial (Cliente 2).
 """
 
 import pandas as pd
@@ -18,7 +17,6 @@ import re
 class OptimizadorVRP:
     def __init__(self):
         self.parametros = {}
-        # Coordenadas reales 
         self.vertederos_reales = {
             'LAGUNA': {'coords': (40.3460, -3.7007), 'nombre': 'Laguna del Marquesado'},
             'VALDEMINGOMEZ': {'coords': (40.3186, -3.6017), 'nombre': 'Valdemingómez'},
@@ -28,24 +26,6 @@ class OptimizadorVRP:
 
     def configurar(self, **kwargs):
         self.parametros = kwargs
-
-    def parse_time_window(self, hora_str):
-        if not hora_str or 'flex' in str(hora_str).lower() or 'nan' in str(hora_str).lower() or '-' in str(hora_str):
-            return 0, 18000 # Flexible: 7:00 a 12:00 (18000s)
-        
-        match = re.search(r'(\d{1,2})[:\.](\d{2})', str(hora_str))
-        if match:
-            h, m = int(match.group(1)), int(match.group(2))
-            if h < 7: h = 7 
-            if h > 12: h = 12 
-            
-            segundos_desde_7 = (h - 7) * 3600 + m * 60
-            min_sec = segundos_desde_7
-            # Le damos 2 horas de margen hacia adelante para que no colapse el Solver
-            max_sec = min(18000, segundos_desde_7 + 7200) 
-            return min_sec, max_sec
-            
-        return 0, 18000
 
     def optimizar(self, df_input):
         try:
@@ -66,21 +46,16 @@ class OptimizadorVRP:
             nodos.append({'tipo': 'BASE', 'coords': self.base['coords'], 'nombre': 'Base', 'demand_full': 0, 'demand_empty': 0, 'demand_arido': 0, 'vertedero_req': 'CUALQUIERA', 'hora_pide': ''})
             
             for idx, row in df_clientes.iterrows():
-                direccion_cliente = str(row.get('Direccion', '')).replace('nan', '')
-                concepto_cliente = str(row.get('Concepto', '')).replace('nan', '')
-                material_cliente = str(row.get('Material', '')).replace('nan', '')
-                hora_pide_cliente = str(row.get('Hora Pide', 'Flexible')).replace('nan', 'Flexible')
-
                 nodos.append({
                     'tipo': 'CLIENTE',
                     'coords': (row['lat'], row['lon']),
                     'nombre': str(row.get('nombre_albaran', 'Sin Nombre')),
                     'comercial': str(row.get('comercial', '')),
-                    'direccion': direccion_cliente,
-                    'concepto': concepto_cliente,
+                    'direccion': str(row.get('Direccion', '')).replace('nan', ''),
+                    'concepto': str(row.get('Concepto', '')).replace('nan', ''),
                     'tipo_servicio': row['tipo_servicio'],
-                    'hora_pide': hora_pide_cliente,
-                    'material': material_cliente,
+                    'hora_pide': str(row.get('Hora Pide', 'Flexible')).replace('nan', 'Flexible'),
+                    'material': str(row.get('Material', '')).replace('nan', ''),
                     'demand_full': int(row['demand_full']),   
                     'demand_empty': int(row['demand_empty']), 
                     'demand_arido': int(row['demand_arido']),
@@ -96,32 +71,20 @@ class OptimizadorVRP:
                 v_key = vertederos_keys[i % len(vertederos_keys)]
                 v_data = self.vertederos_reales[v_key]
                 nodos.append({
-                    'tipo': 'VERTEDERO',
-                    'vertedero_id': v_key,
-                    'coords': v_data['coords'],
-                    'nombre': v_data['nombre'],
-                    'demand_full': -1, 
-                    'demand_empty': 0,
-                    'demand_arido': 0,
-                    'vertedero_req': 'CUALQUIERA',
-                    'hora_pide': ''
+                    'tipo': 'VERTEDERO', 'vertedero_id': v_key, 'coords': v_data['coords'],
+                    'nombre': v_data['nombre'], 'demand_full': -1, 'demand_empty': 0,
+                    'demand_arido': 0, 'vertedero_req': 'CUALQUIERA', 'hora_pide': ''
                 })
 
             for i in range(num_copias):
                 nodos.append({
-                    'tipo': 'RECARGA_ARIDO',
-                    'vertedero_id': 'BASE',
-                    'coords': self.base['coords'],
-                    'nombre': 'Planta Áridos',
-                    'demand_full': 0, 
-                    'demand_empty': 0,
-                    'demand_arido': 1, 
-                    'vertedero_req': 'CUALQUIERA',
-                    'hora_pide': ''
+                    'tipo': 'RECARGA_ARIDO', 'vertedero_id': 'BASE', 'coords': self.base['coords'],
+                    'nombre': 'Planta Áridos', 'demand_full': 0, 'demand_empty': 0,
+                    'demand_arido': 1, 'vertedero_req': 'CUALQUIERA', 'hora_pide': ''
                 })
 
             # =========================================================
-            # MATRICES (Blindado)
+            # MATRICES BLINDADAS
             # =========================================================
             size = len(nodos)
             matriz_dist = [[0 for _ in range(size)] for _ in range(size)]
@@ -133,8 +96,9 @@ class OptimizadorVRP:
                         try:
                             d = geodesic(nodos[i]['coords'], nodos[j]['coords']).meters
                             dist_val = int(d)
-                            tiempo_val = int(d / 11.1) + 1200 
-                        except Exception:
+                            # Tiempo viaje + 15 min servicio en obra
+                            tiempo_val = int(d / 11.1) + 900 
+                        except:
                             dist_val = 1000000; tiempo_val = 1000000
                             
                         if nodos[i]['tipo'] == 'CLIENTE' and nodos[j]['tipo'] == 'VERTEDERO':
@@ -161,15 +125,37 @@ class OptimizadorVRP:
             def time_callback(from_index, to_index):
                 return matriz_tiempo[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
             time_callback_index = routing.RegisterTransitCallback(time_callback)
-            # Damos 1h de espera (3600s slack) por si llegan pronto a la obra
-            routing.AddDimension(time_callback_index, 3600, 18000, False, "Tiempo")
+            
+            # SLACK = 900s (El camión NO PUEDE esperar más de 15 minutos en ninguna parte)
+            routing.AddDimension(time_callback_index, 900, 18000, False, "Tiempo")
             time_dim = routing.GetDimensionOrDie("Tiempo")
 
+            # =========================================================
+            # REGLAS DE TIEMPO BLANDAS (Evitan el CP Solver Fail)
+            # =========================================================
             for i in range(1, size):
                 if nodos[i]['tipo'] == 'CLIENTE':
                     idx = manager.NodeToIndex(i)
-                    min_s, max_s = self.parse_time_window(nodos[i]['hora_pide'])
-                    time_dim.CumulVar(idx).SetRange(int(min_s), int(max_s))
+                    hora_str = str(nodos[i]['hora_pide']).lower()
+                    
+                    h = 7 # Por defecto
+                    match = re.search(r'(\d{1,2})[:\.](\d{2})', hora_str)
+                    if match: h = int(match.group(1))
+                    
+                    if 'flex' in hora_str or hora_str == 'nan' or hora_str == '':
+                        h = 8 # Los flexibles se empujan a partir de las 8:00
+                        
+                    if h < 8:
+                        # Fase 1: Antes de las 8 (Empieza pronto, penalizamos si se hace tarde)
+                        time_dim.SetCumulVarSoftUpperBound(idx, 3600, 10) # 08:00
+                    elif h == 8:
+                        # Fase 2: A partir de las 8 (No debe llegar antes)
+                        # Penalización brutal (100) si llega antes de las 8:00 (3600s)
+                        time_dim.SetCumulVarSoftLowerBound(idx, 3600, 100)
+                    else:
+                        # Fase 3: A partir de las 9 (No debe llegar antes, no importa si tarde)
+                        # Penalización brutal (100) si llega antes de las 9:00 (7200s)
+                        time_dim.SetCumulVarSoftLowerBound(idx, 7200, 100)
 
             def count_client_callback(from_index):
                 return array_is_client[manager.IndexToNode(from_index)]
@@ -178,20 +164,17 @@ class OptimizadorVRP:
 
             def demand_full_callback(from_index):
                 return array_demand_full[manager.IndexToNode(from_index)]
-            full_idx = routing.RegisterUnaryTransitCallback(demand_full_callback)
-            routing.AddDimension(full_idx, 0, 1, True, "CargaSucia")
+            routing.AddDimension(routing.RegisterUnaryTransitCallback(demand_full_callback), 0, 1, True, "CargaSucia")
 
             def demand_arido_callback(from_index):
                 return array_demand_arido[manager.IndexToNode(from_index)]
-            arido_idx = routing.RegisterUnaryTransitCallback(demand_arido_callback)
-            routing.AddDimension(arido_idx, 0, 1, False, "CargaArido")
+            routing.AddDimension(routing.RegisterUnaryTransitCallback(demand_arido_callback), 0, 1, False, "CargaArido")
 
             def demand_empty_callback(from_index):
                 return array_demand_empty[manager.IndexToNode(from_index)]
-            empty_idx = routing.RegisterUnaryTransitCallback(demand_empty_callback)
-            # IMPORTANTE: Esto es ahora INVENTARIO de cajas vacías, no "cajas gastadas"
-            routing.AddDimension(empty_idx, 0, 5, False, "CajasVacias")
+            routing.AddDimension(routing.RegisterUnaryTransitCallback(demand_empty_callback), 0, 5, False, "CajasVacias")
             
+            # RESTRICCIÓN DE CHASIS: Sucia + Árido NUNCA > 1
             solver = routing.solver()
             sucia_dim = routing.GetDimensionOrDie("CargaSucia")
             arido_dim = routing.GetDimensionOrDie("CargaArido")
@@ -199,12 +182,12 @@ class OptimizadorVRP:
             
             for i in range(size):
                 idx = manager.NodeToIndex(i)
-                # Restricción física de chasis
                 solver.Add(sucia_dim.CumulVar(idx) + arido_dim.CumulVar(idx) <= 1)
 
+            # INVENTARIO INICIAL
             for v in range(num_vehiculos):
                 empty_dim.CumulVar(routing.Start(v)).SetRange(0, 5)
-                arido_dim.CumulVar(routing.Start(v)).SetRange(0, 1)
+                arido_dim.CumulVar(routing.Start(v)).SetRange(0, 1) # Puede salir cargado con Árido a las 7:00
 
             for i in range(1, size):
                 idx = manager.NodeToIndex(i)
@@ -213,18 +196,17 @@ class OptimizadorVRP:
                 else:
                     routing.AddDisjunction([idx], 1000000)
 
-            # ESTO SOLUCIONA EL CP SOLVER FAIL (Inserción Paralela)
             search_params = pywrapcp.DefaultRoutingSearchParameters()
             search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
             search_params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-            search_params.time_limit.seconds = 35 
+            search_params.time_limit.seconds = 30 
 
             solution = routing.SolveWithParameters(search_params)
 
             if solution:
                 return self._procesar_solucion(manager, routing, solution, nodos, nombres_conductores)
             else:
-                st.error("❌ No hay solución. O las horas son incompatibles físicamente, o no hay vertederos cerca para descargar.")
+                st.error("❌ No hay solución. O las distancias son inabarcables, o faltan vertederos cerca para descargar.")
                 return {}
 
         except Exception as e:
@@ -240,8 +222,7 @@ class OptimizadorVRP:
             if c2 == 'NAN': c2 = ''
             
             nombre_albaran = c2 if c2 else c1
-            if not nombre_albaran:
-                nombre_albaran = 'SIN NOMBRE'
+            if not nombre_albaran: nombre_albaran = 'SIN NOMBRE'
                 
             comercial = c1 if c2 else ""
             cliente_contexto = c1 + " " + c2
@@ -262,9 +243,9 @@ class OptimizadorVRP:
             es_basculado = 'BASCULADO' in material
             
             tipo = 'RETIRADA'
-            # d_empty AHORA ES INVENTARIO FÍSICO (1 = Sube caja vacía, -1 = Baja caja vacía)
             d_full = 0; d_empty = 0; d_arido = 0
             
+            # FÍSICA DE CARGAS
             if es_arido:
                 if 'SUMINISTRO' in concepto:
                     tipo = 'SUMINISTRO ÁRIDO'; d_full = 0; d_empty = 1; d_arido = -1
@@ -307,9 +288,7 @@ class OptimizadorVRP:
             ruta.append({
                 'Tipo': 'INICIO', 
                 'Direccion': f'Base Valdemingómez (Sale con {cajas_inicio} vacías)', 
-                'Concepto': '🏁 ORIGEN DEL VIAJE', 
-                'Hora Pide': '07:00', 
-                'Material': '-'
+                'Concepto': '🏁 ORIGEN DEL VIAJE', 'Hora Pide': '07:00', 'Material': '-'
             })
             
             while not routing.IsEnd(index):
@@ -328,34 +307,22 @@ class OptimizadorVRP:
                     concepto_formateado = f"CLIENTE: {nombre_formateado}{nota_comercial} - {nodo['tipo_servicio']}"
                     
                     ruta.append({
-                        'Cliente': nombre_formateado,
-                        'Direccion': str(nodo['direccion']),
-                        'Tipo': str(nodo['tipo_servicio']),
-                        'Concepto': concepto_formateado,
-                        'Material': str(nodo['material']),
-                        'Hora Pide': hora_m,
-                        'Hora Estimada': hora_estimada,
-                        'lat': nodo['coords'][0], 'lon': nodo['coords'][1]
+                        'Cliente': nombre_formateado, 'Direccion': str(nodo['direccion']),
+                        'Tipo': str(nodo['tipo_servicio']), 'Concepto': concepto_formateado,
+                        'Material': str(nodo['material']), 'Hora Pide': hora_m,
+                        'Hora Estimada': hora_estimada, 'lat': nodo['coords'][0], 'lon': nodo['coords'][1]
                     })
                 elif nodo['tipo'] == 'VERTEDERO':
                     ruta.append({
-                        'Cliente': f"VERTEDERO {nodo['nombre']}", 
-                        'Tipo': 'VERTIDO', 
-                        'Direccion': 'Descargar Escombro', 
-                        'Concepto': '🏁 BASCULAR (Fin de ciclo)', 
-                        'Hora Pide': '-',
-                        'Hora Estimada': hora_estimada,
-                        'Material': '-'
+                        'Cliente': f"VERTEDERO {nodo['nombre']}", 'Tipo': 'VERTIDO', 
+                        'Direccion': 'Descargar Escombro', 'Concepto': '🏁 BASCULAR (Fin de ciclo)', 
+                        'Hora Pide': '-', 'Hora Estimada': hora_estimada, 'Material': '-'
                     })
                 elif nodo['tipo'] == 'RECARGA_ARIDO':
                     ruta.append({
-                        'Cliente': f"PLANTA {nodo['nombre']}", 
-                        'Tipo': 'CARGA ÁRIDO', 
-                        'Direccion': 'Cargar Material', 
-                        'Concepto': '🏭 PASO POR BASE (Carga Árido)', 
-                        'Hora Pide': '-',
-                        'Hora Estimada': hora_estimada,
-                        'Material': '-'
+                        'Cliente': f"PLANTA {nodo['nombre']}", 'Tipo': 'CARGA ÁRIDO', 
+                        'Direccion': 'Cargar Material', 'Concepto': '🏭 PASO POR BASE (Carga Árido)', 
+                        'Hora Pide': '-', 'Hora Estimada': hora_estimada, 'Material': '-'
                     })
                 
                 index = solution.Value(routing.NextVar(index))
