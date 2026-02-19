@@ -1,5 +1,6 @@
 """
-Algoritmo VRP Experto - VERSIÓN CLIENTES Y COMERCIALES
+Algoritmo VRP Experto - VERSIÓN DEFINITIVA B2B Y ANTI-FALLOS
+- Inventario Físico Real de Cajas (Soluciona CP Solver Fail).
 - Manejo Inteligente de Cliente 1 (Comercial) y Cliente 2 (Final).
 - Respeta estrictamente "Hora Pide" (Límite inferior bloqueado).
 - Restricción física de chasis: CargaSucia + CargaArido <= 1.
@@ -30,7 +31,7 @@ class OptimizadorVRP:
 
     def parse_time_window(self, hora_str):
         if not hora_str or 'flex' in str(hora_str).lower() or 'nan' in str(hora_str).lower() or '-' in str(hora_str):
-            return 0, 18000 
+            return 0, 18000 # Flexible: 7:00 a 12:00 (18000s)
         
         match = re.search(r'(\d{1,2})[:\.](\d{2})', str(hora_str))
         if match:
@@ -40,7 +41,8 @@ class OptimizadorVRP:
             
             segundos_desde_7 = (h - 7) * 3600 + m * 60
             min_sec = segundos_desde_7
-            max_sec = min(18000, segundos_desde_7 + 3600) 
+            # Le damos 2 horas de margen hacia adelante para que no colapse el Solver
+            max_sec = min(18000, segundos_desde_7 + 7200) 
             return min_sec, max_sec
             
         return 0, 18000
@@ -119,7 +121,7 @@ class OptimizadorVRP:
                 })
 
             # =========================================================
-            # MATRICES
+            # MATRICES (Blindado)
             # =========================================================
             size = len(nodos)
             matriz_dist = [[0 for _ in range(size)] for _ in range(size)]
@@ -159,6 +161,7 @@ class OptimizadorVRP:
             def time_callback(from_index, to_index):
                 return matriz_tiempo[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
             time_callback_index = routing.RegisterTransitCallback(time_callback)
+            # Damos 1h de espera (3600s slack) por si llegan pronto a la obra
             routing.AddDimension(time_callback_index, 3600, 18000, False, "Tiempo")
             time_dim = routing.GetDimensionOrDie("Tiempo")
 
@@ -186,6 +189,7 @@ class OptimizadorVRP:
             def demand_empty_callback(from_index):
                 return array_demand_empty[manager.IndexToNode(from_index)]
             empty_idx = routing.RegisterUnaryTransitCallback(demand_empty_callback)
+            # IMPORTANTE: Esto es ahora INVENTARIO de cajas vacías, no "cajas gastadas"
             routing.AddDimension(empty_idx, 0, 5, False, "CajasVacias")
             
             solver = routing.solver()
@@ -195,6 +199,7 @@ class OptimizadorVRP:
             
             for i in range(size):
                 idx = manager.NodeToIndex(i)
+                # Restricción física de chasis
                 solver.Add(sucia_dim.CumulVar(idx) + arido_dim.CumulVar(idx) <= 1)
 
             for v in range(num_vehiculos):
@@ -208,8 +213,9 @@ class OptimizadorVRP:
                 else:
                     routing.AddDisjunction([idx], 1000000)
 
+            # ESTO SOLUCIONA EL CP SOLVER FAIL (Inserción Paralela)
             search_params = pywrapcp.DefaultRoutingSearchParameters()
-            search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+            search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
             search_params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
             search_params.time_limit.seconds = 35 
 
@@ -218,7 +224,7 @@ class OptimizadorVRP:
             if solution:
                 return self._procesar_solucion(manager, routing, solution, nodos, nombres_conductores)
             else:
-                st.error("❌ No hay solución. O las horas son incompatibles físicamente, o faltan vertederos cerca para descargar.")
+                st.error("❌ No hay solución. O las horas son incompatibles físicamente, o no hay vertederos cerca para descargar.")
                 return {}
 
         except Exception as e:
@@ -227,22 +233,17 @@ class OptimizadorVRP:
 
     def _procesar_conceptos(self, df):
         def analizar(row):
-            # 1. Extracción de Cliente 1 (Comercial) y Cliente 2 (Final)
             c1 = str(row.get('Cliente 1', row.get('Cliente', ''))).strip().upper()
             c2 = str(row.get('Cliente 2', '')).strip().upper()
             
             if c1 == 'NAN': c1 = ''
             if c2 == 'NAN': c2 = ''
             
-            # El nombre del Albarán prioriza al Cliente 2 si existe
             nombre_albaran = c2 if c2 else c1
             if not nombre_albaran:
                 nombre_albaran = 'SIN NOMBRE'
                 
-            # Guardamos el comercial para informar al conductor en el WhatsApp
             comercial = c1 if c2 else ""
-            
-            # Para decidir el vertedero evaluamos ambos para no perder la orden del comercial
             cliente_contexto = c1 + " " + c2
             
             vertedero_req = 'CUALQUIERA'
@@ -261,33 +262,33 @@ class OptimizadorVRP:
             es_basculado = 'BASCULADO' in material
             
             tipo = 'RETIRADA'
+            # d_empty AHORA ES INVENTARIO FÍSICO (1 = Sube caja vacía, -1 = Baja caja vacía)
             d_full = 0; d_empty = 0; d_arido = 0
             
             if es_arido:
                 if 'SUMINISTRO' in concepto:
-                    tipo = 'SUMINISTRO ÁRIDO'; d_full = 0; d_empty = -1; d_arido = -1
+                    tipo = 'SUMINISTRO ÁRIDO'; d_full = 0; d_empty = 1; d_arido = -1
                 elif 'CAMBIO' in concepto:
                     tipo = 'CAMBIO CON ÁRIDO'; d_full = 1; d_empty = 0; d_arido = -1
                 elif 'DEPOSITO' in concepto:
                     tipo = 'DEPÓSITO ÁRIDO'; d_full = 0; d_empty = 0; d_arido = -1
                 elif 'RETIRADA' in concepto:
                     if es_basculado:
-                        tipo = 'RETIRADA ÁRIDO BASCULADO'; d_full = 1; d_empty = -1; d_arido = -1
+                        tipo = 'RETIRADA ÁRIDO BASCULADO'; d_full = 1; d_empty = 1; d_arido = -1
                     else:
                         tipo = 'RETIRADA ÁRIDO DEJA CAJA'; d_full = 1; d_empty = 0; d_arido = -1
             else:
                 if 'CAMBIO' in concepto:
-                    tipo = 'CAMBIO'; d_full = 1; d_empty = 1; d_arido = 0
+                    tipo = 'CAMBIO'; d_full = 1; d_empty = -1; d_arido = 0
                 elif 'DEPOSITO' in concepto or 'ENTREGA' in concepto:
-                    tipo = 'DEPOSITO'; d_full = 0; d_empty = 1; d_arido = 0
+                    tipo = 'DEPOSITO'; d_full = 0; d_empty = -1; d_arido = 0
                 elif 'RETIRADA' in concepto or 'RECOGIDA' in concepto:
                     tipo = 'RETIRADA'; d_full = 1; d_empty = 0; d_arido = 0
                 elif 'SUMINISTRO' in concepto:
-                    tipo = 'SUMINISTRO'; d_full = 0; d_empty = -1; d_arido = 0
+                    tipo = 'SUMINISTRO'; d_full = 0; d_empty = 1; d_arido = 0
             
             return pd.Series([tipo, d_full, d_empty, d_arido, vertedero_req, zbe, nombre_albaran, comercial])
 
-        # Aseguramos que el apply devuelve las columnas exactas
         df[['tipo_servicio', 'demand_full', 'demand_empty', 'demand_arido', 'vertedero_req', 'zbe', 'nombre_albaran', 'comercial']] = df.apply(analizar, axis=1)
         return df
 
