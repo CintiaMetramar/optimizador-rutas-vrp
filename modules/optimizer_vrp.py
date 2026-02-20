@@ -1,5 +1,6 @@
 """
-Algoritmo VRP Experto - REGLAS DE NEGOCIO ESTRICTAS
+Algoritmo VRP Experto - REGLAS DE NEGOCIO ESTRICTAS Y VISUALIZACIÓN
+- Origen dinámico: Fusiona la carga de árido matutina (Salida 07:10).
 - Orden natural de obra: Retiradas a las 7:00, Depósitos a partir de las 9:00.
 - Soporte de día completo (soluciona el error con servicios a las 15:00).
 - Minimización de tiempos muertos (Slack penalizado).
@@ -27,10 +28,7 @@ class OptimizadorVRP:
         self.parametros = kwargs
 
     def parse_time_window(self, hora_str, tipo_servicio):
-        """Traductor inteligente de horas basado en la operativa real"""
         hora_str = str(hora_str).lower().strip()
-        
-        # EL DÍA COMPLETO: De 07:00 a 18:00 (11 horas = 39600 segundos)
         
         # 1. DEPÓSITOS (Siempre de 09:00 en adelante)
         if 'deposito' in tipo_servicio.lower() or 'depósito' in tipo_servicio.lower():
@@ -53,7 +51,6 @@ class OptimizadorVRP:
             max_sec = segundos_desde_7 + 3600 # 1 hora de margen de llegada
             return min_sec, max_sec
             
-        # Flexible genérico (Cualquier otra cosa)
         return 0, 39600
 
     def optimizar(self, df_input):
@@ -112,9 +109,6 @@ class OptimizadorVRP:
                     'demand_arido': 1, 'vertedero_req': 'CUALQUIERA', 'hora_pide': ''
                 })
 
-            # =========================================================
-            # MATRICES BLINDADAS
-            # =========================================================
             size = len(nodos)
             matriz_dist = [[0 for _ in range(size)] for _ in range(size)]
             matriz_tiempo = [[0 for _ in range(size)] for _ in range(size)]
@@ -154,7 +148,6 @@ class OptimizadorVRP:
                 return matriz_tiempo[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
             time_callback_index = routing.RegisterTransitCallback(time_callback)
             
-            # Ampliamos horizonte a 39600s para englobar servicios de las 15:00 sin que crashee
             routing.AddDimension(time_callback_index, 39600, 39600, False, "Tiempo")
             time_dim = routing.GetDimensionOrDie("Tiempo")
 
@@ -281,18 +274,38 @@ class OptimizadorVRP:
         rutas = {}
         empty_dim = routing.GetDimensionOrDie('CajasVacias')
         time_dim = routing.GetDimensionOrDie('Tiempo')
+        arido_dim = routing.GetDimensionOrDie('CargaArido')
         
         for vehicle_id in range(routing.vehicles()):
             index = routing.Start(vehicle_id)
             ruta = []
             
             cajas_inicio = solution.Value(empty_dim.CumulVar(index))
+            arido_inicio = solution.Value(arido_dim.CumulVar(index))
+            
             if routing.IsEnd(solution.Value(routing.NextVar(index))): continue
+            
+            # Avanzamos al primer movimiento real para analizarlo
+            index = solution.Value(routing.NextVar(index))
+            primer_nodo = nodos[manager.IndexToNode(index)]
+            
+            sale_cargado_arido = (arido_inicio > 0)
+            hora_salida = "07:00"
+            
+            # Si el programa detectó que debe cargar árido en la base inmediatamente
+            if primer_nodo['tipo'] == 'RECARGA_ARIDO':
+                sale_cargado_arido = True
+                hora_salida = "07:10"
+                index = solution.Value(routing.NextVar(index)) # Lo ocultamos de la lista para fusionarlo
+                
+            texto_arido = " y 📦 1 CAJA DE ÁRIDO" if sale_cargado_arido else ""
             
             ruta.append({
                 'Tipo': 'INICIO', 
-                'Direccion': f'Base Valdemingómez (Sale con {cajas_inicio} vacías)', 
-                'Concepto': '🏁 ORIGEN DEL VIAJE', 'Hora Pide': '07:00', 'Material': '-'
+                'Direccion': f'Base Valdemingómez (Sale con {cajas_inicio} vacías{texto_arido})', 
+                'Concepto': f'🏁 ORIGEN DEL VIAJE (Salida {hora_salida})', 
+                'Hora Pide': hora_salida, 
+                'Material': '-'
             })
             
             while not routing.IsEnd(index):
@@ -323,6 +336,7 @@ class OptimizadorVRP:
                         'Hora Pide': '-', 'Hora Estimada': hora_estimada, 'Material': '-'
                     })
                 elif nodo['tipo'] == 'RECARGA_ARIDO':
+                    # Esto solo se imprimirá si tiene que ir a la base A MITAD de la ruta
                     ruta.append({
                         'Cliente': f"PLANTA {nodo['nombre']}", 'Tipo': 'CARGA ÁRIDO', 
                         'Direccion': 'Cargar Material', 'Concepto': '🏭 PASO POR BASE (Carga Árido)', 
