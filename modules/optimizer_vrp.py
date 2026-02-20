@@ -1,9 +1,8 @@
 """
-Algoritmo VRP Experto - LOGÍSTICA DE OBRA REAL
-- Solución Anti-Fail: Soft Time Windows (Fases de Mañana)
-- 0 Esperas: Límite de slack (espera) a 15 min. No hay camiones parados.
-- Inventario Físico y Chasis: (Sucia + Árido <= 1).
-- Priorización Comercial (Cliente 2).
+Algoritmo VRP Experto - REGLAS DE NEGOCIO ESTRICTAS
+- Orden natural de obra: Retiradas a las 7:00, Depósitos a partir de las 9:00.
+- Soporte de día completo (soluciona el error con servicios a las 15:00).
+- Minimización de tiempos muertos (Slack penalizado).
 """
 
 import pandas as pd
@@ -26,6 +25,36 @@ class OptimizadorVRP:
 
     def configurar(self, **kwargs):
         self.parametros = kwargs
+
+    def parse_time_window(self, hora_str, tipo_servicio):
+        """Traductor inteligente de horas basado en la operativa real"""
+        hora_str = str(hora_str).lower().strip()
+        
+        # EL DÍA COMPLETO: De 07:00 a 18:00 (11 horas = 39600 segundos)
+        
+        # 1. DEPÓSITOS (Siempre de 09:00 en adelante)
+        if 'deposito' in tipo_servicio.lower() or 'depósito' in tipo_servicio.lower():
+            if 'flex' in hora_str or hora_str == '' or hora_str == 'nan':
+                return 7200, 39600 # 7200s son las 09:00
+                
+        # 2. RETIRADAS FLEXIBLES (Forzadas a primera hora)
+        if 'retirada' in tipo_servicio.lower():
+            if 'flex' in hora_str or hora_str == '' or hora_str == 'nan':
+                return 0, 7200 # Entre las 07:00 y las 09:00
+                
+        # 3. HORAS EXPLÍCITAS (Ej: 09:00, 15:00)
+        match = re.search(r'(\d{1,2})[:\.](\d{2})', hora_str)
+        if match:
+            h, m = int(match.group(1)), int(match.group(2))
+            if h < 7: h = 7
+            
+            segundos_desde_7 = (h - 7) * 3600 + m * 60
+            min_sec = segundos_desde_7
+            max_sec = segundos_desde_7 + 3600 # 1 hora de margen de llegada
+            return min_sec, max_sec
+            
+        # Flexible genérico (Cualquier otra cosa)
+        return 0, 39600
 
     def optimizar(self, df_input):
         try:
@@ -54,7 +83,7 @@ class OptimizadorVRP:
                     'direccion': str(row.get('Direccion', '')).replace('nan', ''),
                     'concepto': str(row.get('Concepto', '')).replace('nan', ''),
                     'tipo_servicio': row['tipo_servicio'],
-                    'hora_pide': str(row.get('Hora Pide', 'Flexible')).replace('nan', 'Flexible'),
+                    'hora_pide': str(row.get('Hora Pide', 'Flexible')),
                     'material': str(row.get('Material', '')).replace('nan', ''),
                     'demand_full': int(row['demand_full']),   
                     'demand_empty': int(row['demand_empty']), 
@@ -96,8 +125,7 @@ class OptimizadorVRP:
                         try:
                             d = geodesic(nodos[i]['coords'], nodos[j]['coords']).meters
                             dist_val = int(d)
-                            # Tiempo viaje + 15 min servicio en obra
-                            tiempo_val = int(d / 11.1) + 900 
+                            tiempo_val = int(d / 11.1) + 1200 # Distancia + 20 min en obra
                         except:
                             dist_val = 1000000; tiempo_val = 1000000
                             
@@ -126,36 +154,15 @@ class OptimizadorVRP:
                 return matriz_tiempo[manager.IndexToNode(from_index)][manager.IndexToNode(to_index)]
             time_callback_index = routing.RegisterTransitCallback(time_callback)
             
-            # SLACK = 900s (El camión NO PUEDE esperar más de 15 minutos en ninguna parte)
-            routing.AddDimension(time_callback_index, 900, 18000, False, "Tiempo")
+            # Ampliamos horizonte a 39600s para englobar servicios de las 15:00 sin que crashee
+            routing.AddDimension(time_callback_index, 39600, 39600, False, "Tiempo")
             time_dim = routing.GetDimensionOrDie("Tiempo")
 
-            # =========================================================
-            # REGLAS DE TIEMPO BLANDAS (Evitan el CP Solver Fail)
-            # =========================================================
             for i in range(1, size):
                 if nodos[i]['tipo'] == 'CLIENTE':
                     idx = manager.NodeToIndex(i)
-                    hora_str = str(nodos[i]['hora_pide']).lower()
-                    
-                    h = 7 # Por defecto
-                    match = re.search(r'(\d{1,2})[:\.](\d{2})', hora_str)
-                    if match: h = int(match.group(1))
-                    
-                    if 'flex' in hora_str or hora_str == 'nan' or hora_str == '':
-                        h = 8 # Los flexibles se empujan a partir de las 8:00
-                        
-                    if h < 8:
-                        # Fase 1: Antes de las 8 (Empieza pronto, penalizamos si se hace tarde)
-                        time_dim.SetCumulVarSoftUpperBound(idx, 3600, 10) # 08:00
-                    elif h == 8:
-                        # Fase 2: A partir de las 8 (No debe llegar antes)
-                        # Penalización brutal (100) si llega antes de las 8:00 (3600s)
-                        time_dim.SetCumulVarSoftLowerBound(idx, 3600, 100)
-                    else:
-                        # Fase 3: A partir de las 9 (No debe llegar antes, no importa si tarde)
-                        # Penalización brutal (100) si llega antes de las 9:00 (7200s)
-                        time_dim.SetCumulVarSoftLowerBound(idx, 7200, 100)
+                    min_s, max_s = self.parse_time_window(nodos[i]['hora_pide'], nodos[i]['tipo_servicio'])
+                    time_dim.CumulVar(idx).SetRange(int(min_s), int(max_s))
 
             def count_client_callback(from_index):
                 return array_is_client[manager.IndexToNode(from_index)]
@@ -174,7 +181,6 @@ class OptimizadorVRP:
                 return array_demand_empty[manager.IndexToNode(from_index)]
             routing.AddDimension(routing.RegisterUnaryTransitCallback(demand_empty_callback), 0, 5, False, "CajasVacias")
             
-            # RESTRICCIÓN DE CHASIS: Sucia + Árido NUNCA > 1
             solver = routing.solver()
             sucia_dim = routing.GetDimensionOrDie("CargaSucia")
             arido_dim = routing.GetDimensionOrDie("CargaArido")
@@ -184,10 +190,9 @@ class OptimizadorVRP:
                 idx = manager.NodeToIndex(i)
                 solver.Add(sucia_dim.CumulVar(idx) + arido_dim.CumulVar(idx) <= 1)
 
-            # INVENTARIO INICIAL
             for v in range(num_vehiculos):
                 empty_dim.CumulVar(routing.Start(v)).SetRange(0, 5)
-                arido_dim.CumulVar(routing.Start(v)).SetRange(0, 1) # Puede salir cargado con Árido a las 7:00
+                arido_dim.CumulVar(routing.Start(v)).SetRange(0, 1)
 
             for i in range(1, size):
                 idx = manager.NodeToIndex(i)
@@ -197,7 +202,7 @@ class OptimizadorVRP:
                     routing.AddDisjunction([idx], 1000000)
 
             search_params = pywrapcp.DefaultRoutingSearchParameters()
-            search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
+            search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
             search_params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
             search_params.time_limit.seconds = 30 
 
@@ -206,7 +211,7 @@ class OptimizadorVRP:
             if solution:
                 return self._procesar_solucion(manager, routing, solution, nodos, nombres_conductores)
             else:
-                st.error("❌ No hay solución. O las distancias son inabarcables, o faltan vertederos cerca para descargar.")
+                st.error("❌ No hay solución viable. Revisa si hay direcciones mal puestas.")
                 return {}
 
         except Exception as e:
@@ -245,7 +250,6 @@ class OptimizadorVRP:
             tipo = 'RETIRADA'
             d_full = 0; d_empty = 0; d_arido = 0
             
-            # FÍSICA DE CARGAS
             if es_arido:
                 if 'SUMINISTRO' in concepto:
                     tipo = 'SUMINISTRO ÁRIDO'; d_full = 0; d_empty = 1; d_arido = -1
